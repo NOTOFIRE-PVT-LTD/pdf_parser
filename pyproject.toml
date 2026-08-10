@@ -1,19 +1,35 @@
 [project]
 name = "tender-parser"
 version = "1.0.0"
-description = "Offline tender/NIT PDF extraction — FastAPI + Streamlit"
+description = "Offline tender/NIT PDF extraction API (FastAPI) — the Vercel deployment target"
 requires-python = ">=3.12"
+# This is the dependency set for the Vercel serverless FastAPI deployment
+# ONLY (app.api.main:app) — it is deliberately NOT the same as
+# requirements.txt, which installs everything for local/full-featured use
+# (Streamlit UI + OCR) via run_api.bat / run_streamlit.bat.
+#
+# Trimmed out here, and why it's safe:
+#   - streamlit (+ its pyarrow/altair transitive deps, ~125MB): the API
+#     (app/api/main.py) never imports app/streamlit_app.py at all, and
+#     Streamlit's long-running server process can't run as a Vercel
+#     function regardless — it needs a different host if you want the UI
+#     live too.
+#   - opencv-python-headless (~110MB): only used for OCR image
+#     preprocessing, which can't functionally work on Vercel anyway (no
+#     Tesseract system binary available in this runtime). Removing it is
+#     safe because app/ocr/ocr_service.py now imports cv2 defensively —
+#     OcrService.is_available() reports OCR as unavailable with a clear
+#     message instead of the app crashing at import time.
+#   - jinja2: not referenced anywhere in the API's import chain.
+# Together this was the fix for "Total bundle size exceeds 500 MB".
 dependencies = [
-    "streamlit>=1.32.0",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.27.0",
     "python-multipart>=0.0.9",
-    "jinja2>=3.1.3",
     "pdfplumber>=0.11.0",
     "pdfminer.six>=20231228",
     "PyMuPDF>=1.24.0",
     "pytesseract>=0.3.10",
-    "opencv-python-headless>=4.9.0",
     "Pillow>=10.2.0",
     "numpy>=1.26.0",
     "pandas>=2.2.0",

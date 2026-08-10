@@ -2,7 +2,14 @@
 OCR service using Tesseract + OpenCV preprocessing.
 
 Used automatically when the PDF is classified as scanned or mixed.
-Fails gracefully with a clear error message if Tesseract is missing.
+Fails gracefully with a clear error message if Tesseract is missing — and,
+same as that, if OpenCV itself isn't installed. cv2 is optional at import
+time (see the try/except below) so this module — and therefore the whole
+app, since app.services.pipeline imports OcrService unconditionally — can
+still load in a minimal deployment that omits opencv-python-headless (a
+~110MB dependency) for image size reasons. OCR then just reports itself as
+unavailable via is_available(), the same graceful path already used when
+the Tesseract binary itself is missing.
 """
 
 from __future__ import annotations
@@ -12,10 +19,16 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
-import cv2
 import numpy as np
 import pytesseract
 from PIL import Image
+
+try:
+    import cv2
+    _CV2_IMPORT_ERROR: Exception | None = None
+except ImportError as exc:  # pragma: no cover - exercised only where cv2 isn't installed
+    cv2 = None  # type: ignore[assignment]
+    _CV2_IMPORT_ERROR = exc
 
 from app.config import Settings, get_settings
 from app.parser.pdf_parser import PdfParser
@@ -65,6 +78,11 @@ class OcrService:
             pytesseract.pytesseract.tesseract_cmd = str(default_win)
 
     def is_available(self) -> tuple[bool, str | None]:
+        if _CV2_IMPORT_ERROR is not None:
+            return False, (
+                "OCR image-preprocessing dependency (OpenCV/cv2) is not installed in this "
+                f"environment ({_CV2_IMPORT_ERROR}). Install opencv-python-headless to enable OCR."
+            )
         try:
             version = pytesseract.get_tesseract_version()
             return True, str(version)
@@ -159,6 +177,10 @@ class OcrService:
         Grayscale → denoise → adaptive threshold for better OCR on scans.
         Accepts RGB (from PIL) and converts to grayscale.
         """
+        if cv2 is None:
+            raise OcrError(
+                "OpenCV (cv2) is not installed in this environment — OCR preprocessing unavailable."
+            )
         if image_bgr_or_rgb.ndim == 3:
             gray = cv2.cvtColor(image_bgr_or_rgb, cv2.COLOR_RGB2GRAY)
         else:
