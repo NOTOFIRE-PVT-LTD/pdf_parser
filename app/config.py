@@ -7,6 +7,8 @@ AI providers are disabled by default; enable via environment variables when read
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 from functools import lru_cache
 
@@ -15,6 +17,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Project root: .../Pdf Parser
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Serverless platforms (Vercel, AWS Lambda, ...) ship a read-only filesystem
+# except for /tmp. Writing to PROJECT_ROOT/data there raises PermissionError
+# on the very first request. Detect that and default storage under /tmp
+# instead — local development (no such env vars set) is unaffected.
+_IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+_DATA_ROOT = Path(tempfile.gettempdir()) / "tender_parser" if _IS_SERVERLESS else PROJECT_ROOT / "data"
 
 
 class Settings(BaseSettings):
@@ -31,9 +40,9 @@ class Settings(BaseSettings):
     debug: bool = False
 
     # Storage
-    upload_dir: Path = PROJECT_ROOT / "data" / "uploads"
-    export_dir: Path = PROJECT_ROOT / "data" / "exports"
-    cache_dir: Path = PROJECT_ROOT / "data" / "cache"
+    upload_dir: Path = _DATA_ROOT / "uploads"
+    export_dir: Path = _DATA_ROOT / "exports"
+    cache_dir: Path = _DATA_ROOT / "cache"
 
     # PDF / OCR
     # Characters below this page density → treat page as scanned / image-only
