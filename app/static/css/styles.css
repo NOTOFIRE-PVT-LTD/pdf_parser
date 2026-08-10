@@ -1,0 +1,66 @@
+/* Tender Parser — Streamlit custom styles (dark-mode aware) */
+
+:root {
+  --tp-accent: #2f6fed;
+  --tp-accent-2: #1bbf9a;
+  --tp-radius: 14px;
+  --tp-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+}
+
+html, body, [class*="css"] {
+  font-family: "Segoe UI", "IBM Plex Sans", "Source Sans 3", sans-serif;
+}
+
+.tp-hero {
+  padding: 1.25rem 1.5rem;
+  border-radius: var(--tp-radius);
+  background: linear-gradient(135deg, rgba(47, 111, 237, 0.12), rgba(27, 191, 154, 0.10));
+  border: 1px solid rgba(47, 111, 237, 0.18);
+  margin-bottom: 1rem;
+}
+
+.tp-hero h1 {
+  margin: 0 0 0.35rem 0;
+  font-size: 1.8rem;
+  letter-spacing: -0.02em;
+}
+
+.tp-hero p {
+  margin: 0;
+  opacity: 0.85;
+}
+
+.tp-card {
+  border-radius: var(--tp-radius);
+  padding: 1rem 1.1rem;
+  box-shadow: var(--tp-shadow);
+  border: 1px solid rgba(128, 128, 128, 0.2);
+  margin-bottom: 0.75rem;
+}
+
+.tp-badge {
+  display: inline-block;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  background: rgba(47, 111, 237, 0.15);
+  color: inherit;
+}
+
+.tp-badge.ok { background: rgba(27, 191, 154, 0.18); }
+.tp-badge.warn { background: rgba(245, 158, 11, 0.2); }
+.tp-badge.err { background: rgba(239, 68, 68, 0.18); }
+
+div[data-testid="stFileUploader"] {
+  border: 2px dashed rgba(47, 111, 237, 0.35);
+  border-radius: var(--tp-radius);
+  padding: 0.5rem;
+}
+
+/* Dark mode polish when Streamlit theme is dark */
+@media (prefers-color-scheme: dark) {
+  .tp-hero {
+    background: linear-gradient(135deg, rgba(47, 111, 237, 0.22), rgba(27, 191, 154, 0.14));
+  }
+}
