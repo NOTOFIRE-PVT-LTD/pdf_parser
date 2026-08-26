@@ -327,6 +327,85 @@ Description:- Supply of Optical Fibre Joint Closure
     assert "Slave telephone" in (products[1].description or "")
     assert any(p.item_code == "NS11" for p in products)
 
+
+def test_split_description_label_on_own_line():
+    """PDF text often puts 'Description:-' alone, body on the next line(s)."""
+    sample = """
+Schedule () A-Supply
+1 08 5.00 Numbers 177112.00 885560.00 AT Par 885560.00
+Description:-
+Supply of Disconnect Terminal Block, Screw less type, as per RDSO Spec
+2 09 10.00 Numbers 2500.00 25000.00 AT Par 25000.00
+Description:-
+Supply of embedded software for RTU to suit GSM/GPRS/4G
+3 10 2.00 Numbers 4500.00 9000.00 AT Par 9000.00
+Description:- Q-Series Neutral Line Relay (QN1 Type), 12F/4B, 24V DC
+"""
+    products = ProductExtractor().extract(sample)
+    assert len(products) == 3
+    assert all((p.description or "").strip() for p in products)
+    assert "Disconnect Terminal Block" in (products[0].description or "")
+    assert "embedded software" in (products[1].description or "")
+    assert "Neutral Line Relay" in (products[2].description or "")
+    # Each product keeps its own description (no cross-wiring)
+    assert "Disconnect" not in (products[1].description or "")
+    assert "Disconnect" not in (products[2].description or "")
+
+
+def test_description_after_wrapped_bid_and_page_break():
+    """Real IREPS extract: Below/P + ar + page header, then Description:-."""
+    sample = """
+Schedule () A-Supply
+Above/
+41 5.00 Numbers 177112.00 885560.00 AT Par 885560.00 Below/P
+ar
+Page 6 of 18 Run Date/Time: 19/06/2026 16:08:28
+
+HOWRAH DIVISION-S AND T/EASTERN RLY
+TENDER DOCUMENT
+Tender No: SDSTE-LCGATE-05NOs-26 Closing Date/Time: 06/07/2026 15:00
+Description:- "Supply of Micro Processor based Remote Terminal Unit (RTU) with 64 digital input &
+16 analog input with DOT Matrix Printer. Inspection: RDSO"
+Above/
+42 5.00 Numbers 19811.00 99055.00 AT Par 99055.00 Below/P
+ar
+Description:- Installation, wiring, testing & commissioning of Micro Processor based Remote
+Terminal Unit (RTU). Inspection: Consignee.
+Above/
+46 5.00 Numbers 20166.00 100830.00 AT Par 100830.00 Below/P
+46 ar
+Description:- Testing commissioning of total system including local report system, firewall, static IP
+to bring DATA of RTUs through GPRS to CMU
+"""
+    products = ProductExtractor().extract(sample)
+    by_sno = {p.s_no: p for p in products}
+    assert "41" in by_sno and "42" in by_sno and "46" in by_sno
+    assert by_sno["41"].description and "Remote Terminal Unit" in by_sno["41"].description
+    assert by_sno["42"].description and "Installation, wiring" in by_sno["42"].description
+    assert by_sno["46"].description and "Testing commissioning" in by_sno["46"].description
+
+
+def test_station_unit_item_keeps_description():
+    """Design/BOQ rows use Qty Unit = Station (not Numbers/Month)."""
+    sample = """
+Schedule () A-Supply
+Above/
+114 5.00 Station 58797.00 293985.00 AT Par 293985.00 Below/P
+ar
+Description:- Design of circuits in connection with preparation of wiring diagrams as per approved
+Signalling Plan and submission of indoor as well as outdoor completion documents for alteration
+work. It includes Route Section Plan (RSP), Selection Table (ST), Locking Table (LT) and Control Panel
+Diagram (CPD). All drawings will be prepared in CAD. Inspection: Consignee.
+"""
+    products = ProductExtractor().extract(sample)
+    assert len(products) == 1
+    p = products[0]
+    assert p.s_no == "114"
+    assert p.qty_unit and "Station" in p.qty_unit
+    assert p.description and "Design of circuits" in p.description
+    assert "Control Panel" in p.description
+
+
 def test_products_from_schedule_table():
     headers = [
         "S.No.",

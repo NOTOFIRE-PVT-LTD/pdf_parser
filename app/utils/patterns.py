@@ -364,9 +364,12 @@ PRODUCT_SECTION_HINTS = re.compile(
     re.IGNORECASE,
 )
 
-# IREPS schedule item description line
+# IREPS schedule item description line.
+# Desc may be empty when the body starts on the next line:
+#   Description:-
+#   Supply of Disconnect Terminal Block...
 DESCRIPTION_LINE = re.compile(
-    r"(?im)^\s*description\s*[:\-–]\s*(?P<desc>.+?)\s*$"
+    r"(?im)^\s*description\s*[:\-–]\s*(?P<desc>.*?)\s*$"
 )
 
 # Numeric schedule data row (fallback when table extraction is weak)

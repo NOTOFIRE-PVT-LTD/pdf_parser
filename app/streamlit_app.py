@@ -82,16 +82,16 @@ def _init_state() -> None:
         "pdf_password": "",
         "enrich_ai": env_ai_active or saved.get("enrich_ai", False),
         "ai_provider": settings.ai_provider if env_ai_active else saved.get("ai_provider", "gemini"),
-        "schema_version": 7,
+        "schema_version": 11,
         "_settings_loaded": True,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
     # Drop stale results created before TenderInformation schema change
-    if st.session_state.get("schema_version") != 7:
+    if st.session_state.get("schema_version") != 11:
         st.session_state.results = []
-        st.session_state.schema_version = 7
+        st.session_state.schema_version = 11
     else:
         cleaned = []
         for r in st.session_state.results:
@@ -239,37 +239,6 @@ def _render_result(result: TenderResult, idx: int) -> None:
         else:
             st.info("No products matched.")
 
-    with st.expander("Financial", expanded=False):
-        _kv_table(result.financial.model_dump())
-
-    with st.expander("Important Dates", expanded=False):
-        _kv_table(result.dates.model_dump())
-
-    with st.expander("Eligibility", expanded=False):
-        _kv_table(result.eligibility.model_dump())
-
-    with st.expander(f"Documents Required ({len(result.documents_required)})", expanded=False):
-        if result.documents_required:
-            for doc in result.documents_required:
-                st.markdown(f"- {doc}")
-        else:
-            st.caption("None detected.")
-
-    with st.expander(f"Important Clauses ({len(result.important_clauses)})", expanded=False):
-        if not result.important_clauses:
-            st.caption("None detected.")
-        for clause in result.important_clauses:
-            st.markdown(f"**{clause.clause_type}**")
-            st.write(clause.content or "—")
-            st.divider()
-
-    with st.expander("Contact Details", expanded=False):
-        _kv_table(result.contact_details.model_dump())
-
-    with st.expander("Preview / Raw text (truncated)", expanded=False):
-        preview = (result.raw_text or "")[:8000]
-        st.text_area("Extracted text", preview, height=240, key=f"preview_{idx}")
-
     exporter = ExportService(settings)
     json_str = exporter.to_json_str(result)
     stem = Path(meta.filename if meta else f"tender_{idx}").stem
@@ -312,8 +281,6 @@ def _render_result(result: TenderResult, idx: int) -> None:
             use_container_width=True,
             help="Browsers block clipboard writes without a secure context; download the JSON to copy locally.",
         )
-    with st.expander("JSON output", expanded=False):
-        st.code(json_str, language="json")
 
 
 def main() -> None:

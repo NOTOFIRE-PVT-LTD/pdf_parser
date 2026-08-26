@@ -18,17 +18,33 @@ from app.parser.table_parser import ExtractedTable, TableParser
 from app.utils.patterns import DESCRIPTION_LINE, PRODUCT_SECTION_HINTS
 from app.utils.text_utils import collapse_whitespace, truncate
 
-# Qty units seen across IREPS schedules (personnel + materials/NS items)
+# Qty units seen across IREPS schedules (personnel + materials + design items)
 _UNIT = (
     r"Months?|Numbers?|Nos?\.?|Sets?|Each|Kgs?|Mtrs?|Metres?|Meters?|"
     r"Units?|Lumpsum|Job|Hour|Hrs?|Day|Days?|Pair|Pairs|Lot|Lots|"
-    r"Cum|Cmt|Sqm|Rmt|Kg|Ton|Tonne|Litres?|Ltr|Packet|Pkts?"
+    r"Cum|Cmt|Sqm|Rmt|Kg|Ton|Tonne|Litres?|Ltr|Packet|Pkts?|"
+    r"Stations?|Locations?|Sites?|Blocks?|Spans?|Trips?|Shifts?|"
+    r"Km|Kilometres?|Kilometers?|Rm|Running\s*Mtr|"
+    r"[A-Za-z][A-Za-z./\-]{0,20}"
 )
 
 # Item codes: numeric (1, 12) OR alphanumeric (NS1, NS12, A1, …)
 _CODE = r"[A-Za-z]{1,6}\d{1,5}|\d{1,6}"
 
+# Bidding column often shows Rs. / INR / Above/Below/Par (and PDF wraps it)
+_BID = (
+    r"Rs\.?|INR|Above\s*/\s*Below\s*/\s*Par|"
+    r"Above\s*/|Below\s*/?\s*P(?:ar)?|ar|Par"
+)
+_BID_FRAGMENT = re.compile(
+    r"(?i)^\s*(?:Above\s*/?|Below\s*/?\s*P?|ar|Par|Above\s*/\s*Below\s*/\s*Par|Rs\.?|INR)\s*$"
+)
+
+# Keep long IREPS descriptions (RTU / datalogger items can be 4–8 KB)
+_DESC_MAX = 8000
+
 # Layout A: S.No Qty Unit Rate Basic Escl Amount  (code on next line)
+# Trailing bid unit may be partial ("Below/P") because PDF wraps "Above/Below/Par"
 IREPS_ROW_NO_CODE = re.compile(
     rf"(?i)^\s*(?P<sno>\d{{1,4}})\s+"
     rf"(?P<qty>[\d,]+\.\d{{2}})\s+"
@@ -37,11 +53,21 @@ IREPS_ROW_NO_CODE = re.compile(
     rf"(?P<basic>[\d,]+\.\d{{2}})\s+"
     rf"(?P<escl>AT\s*Par|[\d,]+\.?\d*\s*%?)\s+"
     rf"(?P<amount>[\d,]+\.\d{{2}})\s*"
-    rf"(?P<bidunit>Rs\.?|INR)?\s*$"
+    rf"(?P<bidunit>{_BID})?\s*$"
+)
+
+# Amounts row when S.No. was on the previous line (merged S.No. cell)
+IREPS_AMOUNTS_ONLY = re.compile(
+    rf"(?i)^\s*(?P<qty>[\d,]+\.\d{{2}})\s+"
+    rf"(?P<unit>{_UNIT})\s+"
+    rf"(?P<rate>[\d,]+\.\d{{2}})\s+"
+    rf"(?P<basic>[\d,]+\.\d{{2}})\s+"
+    rf"(?P<escl>AT\s*Par|[\d,]+\.?\d*\s*%?)\s+"
+    rf"(?P<amount>[\d,]+\.\d{{2}})\s*"
+    rf"(?P<bidunit>{_BID})?\s*$"
 )
 
 # Layout B/C: S.No ItemCode Qty Unit Rate Basic Escl Amount (inline)
-# Covers numeric codes AND NS1 / NS12 style codes
 FLEX_SCHEDULE_ROW = re.compile(
     rf"(?is)(?<![0-9A-Za-z.])(?P<sno>\d{{1,4}})\s+"
     rf"(?P<code>{_CODE})\s+"
@@ -51,7 +77,7 @@ FLEX_SCHEDULE_ROW = re.compile(
     rf"(?P<basic>[\d,]+\.\d{{2}}|\d+)\s+"
     rf"(?P<escl>AT\s*Par|[\d,]+\.?\d*\s*%?)\s+"
     rf"(?P<amount>[\d,]+\.\d{{2}}|\d+)"
-    rf"(?:\s+(?P<bidunit>Rs\.?|INR))?",
+    rf"(?:\s+(?P<bidunit>{_BID}))?",
     re.IGNORECASE,
 )
 
@@ -120,6 +146,9 @@ class ProductExtractor:
 
         # Merge duplicates, keep richest row for each identity
         products = self._merge_all(collected)
+        # Fill Description when amounts were found but the label/body
+        # was on the next line / next page / only in another extract path
+        products = self._backfill_missing_descriptions(products, text)
 
         return products
 
@@ -159,9 +188,12 @@ class ProductExtractor:
                 return collapse_whitespace(row[idx])
 
             desc_only = None
-            dm = re.search(r"(?i)description\s*[:\-–]\s*(.+)", joined)
+            dm = re.search(r"(?i)description\s*[:\-–]\s*(.*)$", joined)
             if dm:
-                desc_only = collapse_whitespace(dm.group(1))
+                desc_only = collapse_whitespace(dm.group(1) or "") or None
+                # Bare "Description:-" with no body — still a continuation marker
+                if desc_only is None and re.search(r"(?i)description\s*[:\-–]", joined):
+                    desc_only = ""
 
             s_no = cell("s_no")
             item_qty = cell("item_qty")
@@ -180,14 +212,21 @@ class ProductExtractor:
 
             if is_continuation:
                 prev = items[-1]
-                extra = desc_only or cell("description") or joined
-                if extra and not re.match(r"(?i)^description\s*[:\-–]?\s*$", extra):
-                    extra = re.sub(r"(?i)^description\s*[:\-–]\s*", "", extra).strip()
+                extra = desc_only if desc_only is not None else (
+                    cell("description") or joined
+                )
+                if extra is not None and not re.match(
+                    r"(?i)^description\s*[:\-–]?\s*$", str(extra)
+                ):
+                    extra = re.sub(r"(?i)^description\s*[:\-–]\s*", "", str(extra)).strip()
                     extra = extra.lstrip("-–— ").strip()
-                    prev.description = truncate(
-                        collapse_whitespace(((prev.description or "") + " " + extra).strip()),
-                        2000,
-                    )
+                    if extra:
+                        prev.description = truncate(
+                            collapse_whitespace(
+                                ((prev.description or "") + " " + extra).strip()
+                            ),
+                            2000,
+                        )
                 if table.page_number not in prev.page_numbers:
                     prev.page_numbers.append(table.page_number)
                 continue
@@ -226,7 +265,7 @@ class ProductExtractor:
                     escalation=cell("escalation"),
                     amount=cell("amount"),
                     bidding_unit=cell("bidding_unit") or "Rs.",
-                    description=truncate(description, 2000) if description else None,
+                    description=truncate(description, _DESC_MAX) if description else None,
                     schedule=schedule,
                     page_numbers=[table.page_number],
                 )
@@ -339,14 +378,58 @@ class ProductExtractor:
                     i += 1
                     continue
 
+                # Never drop "awaiting Description" across wrapped bid units / page headers
+                if (
+                    awaiting_description
+                    and items
+                    and (
+                        _BID_FRAGMENT.match(line)
+                        or self._is_page_chrome(line)
+                        or re.fullmatch(r"\d{1,4}", line)
+                        or re.match(r"(?i)^\d{1,4}\s+(?:ar|par)\s*$", line)
+                    )
+                ):
+                    i += 1
+                    continue
+
                 dm = DESCRIPTION_LINE.match(line)
                 if dm and items and awaiting_description:
-                    desc = collapse_whitespace(dm.group("desc")) or ""
-                    items[-1].description = truncate(desc.lstrip("-–— ").strip(), 2000)
-                    awaiting_description = False
+                    desc, j = self._read_description_block(
+                        lines, i, sno=items[-1].s_no
+                    )
+                    if desc:
+                        items[-1].description = truncate(desc, _DESC_MAX)
+                        awaiting_description = False
+                        i = j
+                        continue
                     i += 1
                     continue
                 if dm:
+                    i += 1
+                    continue
+
+                # Body text after a bare "Description:-" label (no label on this line)
+                if (
+                    awaiting_description
+                    and items
+                    and not self._is_description_end(line)
+                    and not self._is_page_chrome(line)
+                    and not _BID_FRAGMENT.match(line)
+                ):
+                    if re.fullmatch(r"\d{1,4}", line):
+                        i += 1
+                        continue
+                    prev = items[-1]
+                    chunk = collapse_whitespace(line).lstrip("-–— \"'").strip()
+                    if prev.s_no and re.match(rf"^{re.escape(prev.s_no)}\s+", chunk):
+                        chunk = re.sub(rf"^{re.escape(prev.s_no)}\s+", "", chunk).strip()
+                    if chunk:
+                        prev.description = truncate(
+                            collapse_whitespace(
+                                ((prev.description or "") + " " + chunk).strip()
+                            ),
+                            _DESC_MAX,
+                        )
                     i += 1
                     continue
 
@@ -364,6 +447,40 @@ class ProductExtractor:
                     )
                     items.append(item)
                     continue
+
+                # Merged S.No. cell: previous line was "42", this line is amounts only
+                rm_amt = IREPS_AMOUNTS_ONLY.match(line)
+                if rm_amt:
+                    sno = None
+                    for back in range(i - 1, max(-1, i - 4), -1):
+                        if back < 0:
+                            break
+                        alone = re.match(r"^\s*(\d{1,4})\s*$", lines[back].strip())
+                        if alone:
+                            sno = alone.group(1)
+                            break
+                    if sno:
+                        item = ProductItem(
+                            s_no=str(int(sno)),
+                            item_qty=rm_amt.group("qty"),
+                            qty_unit=rm_amt.group("unit"),
+                            unit_rate=rm_amt.group("rate"),
+                            basic_value=rm_amt.group("basic"),
+                            escalation=collapse_whitespace(rm_amt.group("escl")),
+                            amount=rm_amt.group("amount"),
+                            bidding_unit=(rm_amt.groupdict().get("bidunit") or "Rs."),
+                            schedule=schedule,
+                        )
+                        item.source_pos = region_offset + line_offsets[i]
+                        pg = page_at(line_offsets[i])
+                        if pg:
+                            item.page_numbers = [pg]
+                        i += 1
+                        i, awaiting_description = self._attach_code_and_desc(
+                            item, lines, i, awaiting_description=True
+                        )
+                        items.append(item)
+                        continue
 
                 # Layout B: S.No + ItemCode + amounts on one (possibly wrapped) line
                 window = line
@@ -406,63 +523,176 @@ class ProductExtractor:
         awaiting_description: bool,
     ) -> tuple[int, bool]:
         """Consume following Item Code / Description lines after an amounts row."""
-        while i < len(lines) and not lines[i].strip():
-            i += 1
+        i = self._skip_noise_lines(lines, i, sno=item.s_no)
         if i < len(lines):
             cd = ITEM_CODE_WITH_DESC.match(lines[i].strip())
             if cd:
                 item.item_code = self._normalize_item_code(cd.group("code"))
                 desc = collapse_whitespace(cd.group("desc")) or ""
-                item.description = truncate(desc.lstrip("-–— ").strip(), 2000)
+                item.description = truncate(desc.lstrip("-–— \"'").strip(), _DESC_MAX) or None
                 if not item.item_code and item.s_no:
                     item.item_code = item.s_no
                 return i + 1, False
             cm = ITEM_CODE_ONLY.match(lines[i].strip())
-            if cm:
+            # Don't treat a repeated numeric S.No. as an item code.
+            if cm and not re.fullmatch(r"\d{1,4}", cm.group("code") or ""):
                 item.item_code = self._normalize_item_code(cm.group("code"))
-                # Only mirror numeric codes into s_no (NS1 is not an S.No.)
-                if (
-                    item.item_code
-                    and item.item_code.isdigit()
-                    and (not item.s_no or item.s_no == item.item_code)
-                ):
-                    item.s_no = item.item_code
                 i += 1
+                i = self._skip_noise_lines(lines, i, sno=item.s_no)
         if not item.item_code and item.s_no:
             item.item_code = item.s_no
-        while i < len(lines) and not lines[i].strip():
-            i += 1
+        i = self._skip_noise_lines(lines, i, sno=item.s_no)
         if i < len(lines):
-            d2 = DESCRIPTION_LINE.match(lines[i].strip())
-            if d2:
-                desc = collapse_whitespace(d2.group("desc")) or ""
-                # Append continuation lines that are part of the description
-                j = i + 1
-                parts = [desc]
-                while j < len(lines):
-                    nxt = lines[j].strip()
-                    if not nxt:
-                        break
+            desc, j = self._read_description_block(lines, i, sno=item.s_no)
+            if desc:
+                item.description = truncate(desc, _DESC_MAX)
+                return j, False
+            if DESCRIPTION_LINE.match(lines[i].strip()):
+                return j, True
+        return i, awaiting_description and not bool(item.description)
+
+    def _skip_noise_lines(
+        self, lines: list[str], i: int, sno: str | None = None
+    ) -> int:
+        """Skip blank / bid-wrap / page-header / repeated S.No. lines."""
+        while i < len(lines):
+            raw = lines[i].strip()
+            if not raw:
+                i += 1
+                continue
+            if _BID_FRAGMENT.match(raw):
+                i += 1
+                continue
+            if re.match(r"(?i)^\d{1,4}\s+(?:ar|par|below\s*/?\s*p?)\s*$", raw):
+                i += 1
+                continue
+            if sno and re.fullmatch(re.escape(str(sno)), raw):
+                i += 1
+                continue
+            if re.fullmatch(r"\d{1,4}", raw):
+                # Repeated S.No. from merged cell between amounts and Description
+                i += 1
+                continue
+            if self._is_page_chrome(raw):
+                i += 1
+                continue
+            break
+        return i
+
+    def _read_description_block(
+        self, lines: list[str], i: int, sno: str | None = None
+    ) -> tuple[str | None, int]:
+        """
+        Read a Description:- block starting at lines[i].
+
+        Survives blank lines, page headers, wrapped Above/Below/Par fragments,
+        and repeated S.No. digits that PDF extractors inject into the body.
+        """
+        if i >= len(lines):
+            return None, i
+        line = lines[i].strip()
+        dm = DESCRIPTION_LINE.match(line)
+        if not dm:
+            return None, i
+
+        parts: list[str] = []
+        first = collapse_whitespace(dm.group("desc") or "") or ""
+        first = first.lstrip("-–— \"'").strip()
+        if first:
+            parts.append(first)
+        j = i + 1
+        while j < len(lines):
+            nxt = lines[j].strip()
+            if not nxt:
+                j += 1
+                continue
+            if _BID_FRAGMENT.match(nxt):
+                break
+            if self._is_page_chrome(nxt):
+                j += 1
+                continue
+            if re.fullmatch(r"\d{1,4}", nxt):
+                j += 1
+                continue
+            if sno and re.match(rf"^{re.escape(str(sno))}\s+", nxt):
+                nxt = re.sub(rf"^{re.escape(str(sno))}\s+", "", nxt).strip()
+                if not nxt:
+                    j += 1
+                    continue
+            if ITEM_CODE_ONLY.match(nxt) and not re.fullmatch(r"\d{1,4}", nxt):
+                peek = j + 1
+                while peek < len(lines) and not lines[peek].strip():
+                    peek += 1
+                if peek < len(lines):
+                    peek_l = lines[peek].strip()
                     if (
-                        DESCRIPTION_LINE.match(nxt)
-                        or IREPS_ROW_NO_CODE.match(nxt)
-                        or FLEX_SCHEDULE_ROW.match(nxt)
-                        or ITEM_CODE_ONLY.match(nxt)
-                        or ITEM_CODE_WITH_DESC.match(nxt)
-                        or re.match(r"(?i)^schedule\b", nxt)
-                        or re.match(r"(?i)^(?:page\s+\d+|s\.?no\.?)\b", nxt)
+                        DESCRIPTION_LINE.match(peek_l)
+                        or IREPS_ROW_NO_CODE.match(peek_l)
+                        or IREPS_AMOUNTS_ONLY.match(peek_l)
+                        or FLEX_SCHEDULE_ROW.match(peek_l)
                     ):
                         break
-                    parts.append(nxt)
-                    j += 1
-                    if len(" ".join(parts)) > 1800:
-                        break
-                item.description = truncate(
-                    collapse_whitespace(" ".join(parts)).lstrip("-–— ").strip(),
-                    2000,
-                )
-                return j, False
-        return i, awaiting_description and not bool(item.description)
+                parts.append(nxt)
+                j += 1
+                continue
+            if self._is_description_end(nxt):
+                break
+            parts.append(nxt)
+            j += 1
+            if len(" ".join(parts)) > _DESC_MAX:
+                break
+        if not parts:
+            return None, i + 1
+        text = collapse_whitespace(" ".join(parts)).lstrip("-–— \"'").strip()
+        if not text or JUNK_DESC.search(text):
+            return None, j
+        return text, j
+
+    @staticmethod
+    def _is_page_chrome(line: str) -> bool:
+        """Headers/footers injected between amounts row and Description."""
+        return bool(
+            re.match(
+                r"(?i)^(?:\[\[PAGE:\d+\]\]|page\s+\d+\s+of\s+\d+|"
+                r"tender\s+document|tender\s+no\s*:|closing\s+date|"
+                r"run\s+date\s*/?\s*time|"
+                r"[A-Z][A-Z0-9 \-/]{2,60}DIVISION|"
+                r".{0,60}/\s*(?:EASTERN|WESTERN|NORTHERN|SOUTHERN|CENTRAL)\s+RLY)\b",
+                line,
+            )
+        )
+
+    def _is_description_end(self, line: str) -> bool:
+        """True only when the next real schedule item / section starts."""
+        if DESCRIPTION_LINE.match(line):
+            return True
+        if IREPS_ROW_NO_CODE.match(line):
+            return True
+        if IREPS_AMOUNTS_ONLY.match(line):
+            return True
+        if FLEX_SCHEDULE_ROW.match(line):
+            return True
+        if ITEM_CODE_WITH_DESC.match(line):
+            return True
+        if re.match(r"(?i)^schedule\b", line):
+            return True
+        if re.search(r"(?i)^(?:schedule\s+)?(?:total|grand\s+total)\b", line):
+            return True
+        if re.match(r"(?i)^(?:s\.?no\.?|item\s*code|item\s*qty)\b", line):
+            return True
+        return False
+
+    def _is_new_item_boundary(self, line: str) -> bool:
+        """True if this line starts the next schedule item / section."""
+        if not line:
+            return True
+        if self._is_page_chrome(line) or _BID_FRAGMENT.match(line):
+            return False
+        if self._is_description_end(line):
+            return True
+        if ITEM_CODE_ONLY.match(line) and not re.fullmatch(r"\d{1,4}", line):
+            return True
+        return False
 
     @staticmethod
     def _normalize_item_code(code: str | None) -> str | None:
@@ -565,13 +795,29 @@ class ProductExtractor:
                 pg = page_at(m.start())
                 if pg:
                     item.page_numbers = [pg]
-                tail = active[m.end() : m.end() + 500]
-                dm = re.search(r"(?is)description\s*[:\-–]\s*([^\n]+)", tail)
-                if dm:
-                    item.description = truncate(
-                        collapse_whitespace(dm.group(1)).lstrip("-–— ").strip(),
-                        2000,
+                # Description may be "Description:- text" or label + next line(s)
+                after = active[m.end() : m.end() + 900]
+                after_lines = after.splitlines()
+                desc = None
+                for ai, al in enumerate(after_lines):
+                    al = al.strip()
+                    if not al:
+                        continue
+                    if ITEM_CODE_ONLY.match(al):
+                        continue
+                    desc, _ = self._read_description_block(after_lines, ai)
+                    if desc:
+                        break
+                    # Inline "description:- ..." somewhere in the tail
+                    inline = re.search(
+                        r"(?is)description\s*[:\-–]\s*(\S[^\n]*)", al
                     )
+                    if inline:
+                        desc = collapse_whitespace(inline.group(1)).lstrip("-–— ").strip()
+                        break
+                    break
+                if desc:
+                    item.description = truncate(desc, _DESC_MAX)
                 items.append(item)
 
         return items
@@ -614,18 +860,17 @@ class ProductExtractor:
                 desc = desc.lstrip("-–— ").strip()
                 if not desc or JUNK_DESC.search(desc):
                     continue
-                # Look above for amounts row with this code or bare sno+qty
                 item = self._find_row_above(lines, idx)
                 if item is None:
                     item = ProductItem(
                         item_code=self._normalize_item_code(cd.group("code")),
-                        description=truncate(desc, 2000),
+                        description=truncate(desc, _DESC_MAX),
                     )
                 else:
                     item.item_code = item.item_code or self._normalize_item_code(
                         cd.group("code")
                     )
-                    item.description = truncate(desc, 2000)
+                    item.description = truncate(desc, _DESC_MAX)
                 if item.source_pos is None:
                     item.source_pos = line_offsets[idx]
                 pg = page_at(line_offsets[idx])
@@ -634,40 +879,16 @@ class ProductExtractor:
                 items.append(item)
                 continue
 
-            desc = collapse_whitespace(dm.group("desc")) or ""
-            desc = desc.lstrip("-–— ").strip()
-            if not desc or JUNK_DESC.search(desc):
+            full_desc, _end = self._read_description_block(lines, idx)
+            if not full_desc:
                 continue
-            # Gather multi-line description body
-            j = idx + 1
-            parts = [desc]
-            while j < len(lines):
-                nxt = lines[j].strip()
-                if not nxt:
-                    break
-                if (
-                    DESCRIPTION_LINE.match(nxt)
-                    or IREPS_ROW_NO_CODE.match(nxt)
-                    or FLEX_SCHEDULE_ROW.match(nxt)
-                    or ITEM_CODE_ONLY.match(nxt)
-                    or ITEM_CODE_WITH_DESC.match(nxt)
-                    or re.match(r"(?i)^schedule\b", nxt)
-                    or re.match(r"(?i)^(?:page\s+\d+|s\.?no\.?)\b", nxt)
-                ):
-                    break
-                parts.append(nxt)
-                j += 1
-                if len(" ".join(parts)) > 1800:
-                    break
-            full_desc = truncate(
-                collapse_whitespace(" ".join(parts)).lstrip("-–— ").strip(),
-                2000,
-            )
+            full_desc = truncate(full_desc, _DESC_MAX)
             item = self._find_row_above(lines, idx)
             if item is None:
-                item = ProductItem(s_no=str(len(items) + 1), description=full_desc)
-            else:
-                item.description = full_desc
+                continue  # don't invent orphan description-only rows
+            item.description = full_desc
+            if not item.item_code and item.s_no:
+                item.item_code = item.s_no
             if item.source_pos is None:
                 item.source_pos = line_offsets[idx]
             pg = page_at(line_offsets[idx])
@@ -679,11 +900,17 @@ class ProductExtractor:
     def _find_row_above(self, lines: list[str], desc_idx: int) -> ProductItem | None:
         """Walk upward from a Description line to find the amounts / code row."""
         schedule = None
-        for k in range(desc_idx - 1, max(-1, desc_idx - 12), -1):
+        for k in range(desc_idx - 1, max(-1, desc_idx - 30), -1):
             if k < 0:
                 break
             prev = lines[k].strip()
             if not prev:
+                continue
+            if _BID_FRAGMENT.match(prev) or self._is_page_chrome(prev):
+                continue
+            if re.fullmatch(r"\d{1,4}", prev):
+                continue
+            if re.match(r"(?i)^\d{1,4}\s+(?:ar|par)\s*$", prev):
                 continue
             if re.match(r"(?i)^schedule\b", prev) and "item qty" not in prev.lower():
                 schedule = self._clean_schedule_title(prev)
@@ -703,6 +930,27 @@ class ProductExtractor:
                 if not item.item_code and item.s_no:
                     item.item_code = item.s_no
                 return item
+            rm_amt = IREPS_AMOUNTS_ONLY.match(prev)
+            if rm_amt:
+                sno = None
+                for up in range(k - 1, max(-1, k - 4), -1):
+                    if up < 0:
+                        break
+                    alone = re.match(r"^\s*(\d{1,4})\s*$", lines[up].strip())
+                    if alone:
+                        sno = alone.group(1)
+                        break
+                return ProductItem(
+                    s_no=str(int(sno)) if sno else None,
+                    item_qty=rm_amt.group("qty"),
+                    qty_unit=rm_amt.group("unit"),
+                    unit_rate=rm_amt.group("rate"),
+                    basic_value=rm_amt.group("basic"),
+                    escalation=collapse_whitespace(rm_amt.group("escl")),
+                    amount=rm_amt.group("amount"),
+                    bidding_unit=(rm_amt.groupdict().get("bidunit") or "Rs."),
+                    schedule=schedule,
+                )
             # "NS1 730.00 Day 954.00 ..." without S.No. on same line
             code_row = re.match(
                 rf"(?i)^\s*(?P<code>{_CODE})\s+"
@@ -782,7 +1030,7 @@ class ProductExtractor:
             items.append(
                 ProductItem(
                     s_no=str(idx),
-                    description=truncate(body, 2000),
+                    description=truncate(body, _DESC_MAX),
                     item_qty=qty,
                     qty_unit=unit,
                 )
@@ -898,6 +1146,103 @@ class ProductExtractor:
                 p.description = p.description.lstrip("-–— ").strip()
             if p.schedule:
                 p.schedule = self._clean_schedule_title(p.schedule)
+        return out
+
+    def _backfill_missing_descriptions(
+        self, products: list[ProductItem], text: str
+    ) -> list[ProductItem]:
+        """
+        For products that still have no Description, find the matching
+        Description:- block in the full PDF text by qty/rate/amount/code.
+        """
+        missing = [p for p in products if not (p.description or "").strip()]
+        if not missing or not text:
+            return products
+
+        index = self._build_description_index(text)
+        if not index:
+            return products
+
+        for p in missing:
+            code = (self._normalize_item_code(p.item_code) or "").lower()
+            qty = self._norm_num(p.item_qty)
+            rate = self._norm_num(p.unit_rate)
+            amount = self._norm_num(p.amount)
+            sno = self._norm_num(p.s_no)
+            best: str | None = None
+
+            for entry in index:
+                if code and entry["code"] and entry["code"] == code:
+                    if (not qty or entry["qty"] == qty) and (
+                        not rate or entry["rate"] == rate
+                    ):
+                        best = entry["desc"]
+                        break
+                if qty and rate and amount:
+                    if (
+                        entry["qty"] == qty
+                        and entry["rate"] == rate
+                        and entry["amount"] == amount
+                    ):
+                        best = entry["desc"]
+                        break
+                if sno and qty and rate:
+                    if (
+                        entry["sno"] == sno
+                        and entry["qty"] == qty
+                        and entry["rate"] == rate
+                    ):
+                        best = entry["desc"]
+                        break
+
+            if best:
+                p.description = truncate(best, _DESC_MAX)
+        return products
+
+    def _build_description_index(self, text: str) -> list[dict[str, str]]:
+        """Map each Description:- block to the amounts row immediately above it."""
+        lines = text.splitlines()
+        out: list[dict[str, str]] = []
+        blocked = False
+        for idx, raw in enumerate(lines):
+            line = raw.strip()
+            if not line:
+                continue
+            lower = line.lower()
+            if (
+                re.match(r"(?i)^schedule\b", line)
+                and "item qty" not in lower
+                and "s.no" not in lower
+            ):
+                blocked = bool(
+                    re.search(r"(?i)^(?:schedule\s+)?(?:total|grand\s+total)\b", line)
+                )
+                continue
+            if re.search(r"(?i)^(?:schedule\s+)?(?:total|grand\s+total)\b", line):
+                blocked = True
+                continue
+            if blocked:
+                continue
+            if not DESCRIPTION_LINE.match(line):
+                continue
+            desc, _ = self._read_description_block(lines, idx)
+            if not desc:
+                continue
+            row = self._find_row_above(lines, idx)
+            out.append(
+                {
+                    "desc": desc,
+                    "code": (
+                        self._normalize_item_code(row.item_code) or ""
+                    ).lower()
+                    if row
+                    else "",
+                    "sno": self._norm_num(row.s_no) if row else "",
+                    "qty": self._norm_num(row.item_qty) if row else "",
+                    "rate": self._norm_num(row.unit_rate) if row else "",
+                    "amount": self._norm_num(row.amount) if row else "",
+                }
+            )
         return out
 
     def _sort_key(self, p: ProductItem) -> tuple:

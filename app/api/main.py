@@ -13,7 +13,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from app.config import get_settings
 from app.models.schemas import ExtractionStatus
@@ -41,6 +41,12 @@ exporter = ExportService(settings)
 _RESULTS: dict[str, object] = {}
 
 
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    """This is a JSON API with no page of its own — send browsers to the interactive docs."""
+    return RedirectResponse(url="/docs")
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "app": settings.app_name, "version": settings.app_version}
@@ -51,7 +57,6 @@ async def parse_tender(
     file: UploadFile = File(...),
     password: str | None = Form(default=None),
     enrich_with_ai: bool = Form(default=False),
-):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
