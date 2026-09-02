@@ -12,6 +12,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.utils.windows_asyncio import apply_windows_asyncio_fix
+
+apply_windows_asyncio_fix()
+
 import streamlit as st
 
 from app.config import get_settings

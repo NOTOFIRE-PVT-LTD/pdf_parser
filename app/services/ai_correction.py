@@ -6,12 +6,11 @@ import json
 import logging
 import re
 import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 
 from app.config import Settings, get_settings
 from app.models.schemas import ProductItem
+from app.services.ai.gemini_client import generate_with_fallback
 from app.services.name_learning import get_name_learning
 from app.services.product_sanitize import _renumber_sequential
 from app.utils.product_name import recheck_product_name
@@ -79,75 +78,29 @@ def _parse_response(raw: str) -> dict:
     return json.loads(text)
 
 
-_FALLBACK_MODELS = (
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-latest",
-)
+_MODEL_CACHE: list[str] = []
 
 
-def _normalize_model(model: str) -> str:
-    m = model.strip()
-    if m.startswith("models/"):
-        m = m[7:]
-    return m
-
-
-def _models_to_try(settings: Settings) -> list[str]:
-    primary = _normalize_model(settings.gemini_model)
-    out: list[str] = []
-    for m in [primary, *_FALLBACK_MODELS]:
-        if m and m not in out:
-            out.append(m)
-    return out
-
-
-def _call_gemini_once(settings: Settings, prompt: str, model: str) -> str:
+def _call_gemini(settings: Settings, prompt: str) -> str:
     if not settings.gemini_api_key:
         raise ValueError("GEMINI_API_KEY not set in .env")
-    model = _normalize_model(model)
-    base = settings.gemini_base_url.rstrip("/")
-    url = f"{base}/models/{urllib.parse.quote(model)}:generateContent?key={settings.gemini_api_key}"
-    body = json.dumps({
+    payload = {
         "system_instruction": {"parts": [{"text": _SYSTEM}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.1,
             "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingLevel": "low"},
         },
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    }
+    return generate_with_fallback(
+        settings.gemini_api_key,
+        settings.gemini_model,
+        payload,
+        base_url=settings.gemini_base_url,
+        timeout=75,
+        model_cache=_MODEL_CACHE,
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    candidates = data.get("candidates") or []
-    if not candidates:
-        raise ValueError("Gemini returned no candidates")
-    parts = candidates[0].get("content", {}).get("parts") or []
-    if not parts:
-        raise ValueError("Gemini returned empty content")
-    return parts[0].get("text") or ""
-
-
-def _call_gemini(settings: Settings, prompt: str) -> str:
-    last_error: Exception | None = None
-    for model in _models_to_try(settings):
-        try:
-            return _call_gemini_once(settings, prompt, model)
-        except urllib.error.HTTPError as exc:
-            last_error = exc
-            if exc.code == 404:
-                logger.warning("Gemini model unavailable: %s — trying next", model)
-                continue
-            raise
-    if last_error:
-        raise last_error
-    raise ValueError("No Gemini model available")
 
 
 def apply_ai_fix(
@@ -176,13 +129,24 @@ def apply_ai_fix(
     try:
         raw = _call_gemini(settings, prompt)
         parsed = _parse_response(raw)
+    except RuntimeError as exc:
+        logger.warning("Gemini error: %s", exc)
+        return AiFixResult(0, 0, str(exc), error=str(exc))
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:200]
+        detail = getattr(exc, "detail_text", None) or exc.read().decode("utf-8", errors="replace")[:200]
         logger.warning("Gemini HTTP error: %s %s", exc.code, detail)
-        return AiFixResult(0, 0, f"Gemini API error ({exc.code}). Check GEMINI_API_KEY and GEMINI_MODEL.", error=detail)
+        return AiFixResult(0, 0, f"Gemini API error ({exc.code}). Try again in a minute.", error=detail)
     except urllib.error.URLError as exc:
         logger.warning("Gemini unreachable: %s", exc)
         return AiFixResult(0, 0, "Gemini API not reachable. Check internet connection.", error=str(exc))
+    except (TimeoutError, OSError) as exc:
+        logger.warning("Gemini timed out: %s", exc)
+        return AiFixResult(
+            0, 0,
+            "Gemini did not respond in time. Try again, or set a faster "
+            "GEMINI_MODEL (e.g. gemini-3-flash-preview) in .env.",
+            error=str(exc),
+        )
     except (json.JSONDecodeError, KeyError, IndexError, ValueError) as exc:
         logger.warning("Gemini response parse failed: %s", exc)
         return AiFixResult(0, 0, f"Could not parse Gemini response: {exc}", error=str(exc))

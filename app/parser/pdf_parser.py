@@ -1,7 +1,7 @@
 """
 PDF parsing service.
 
-Uses pdfplumber + PyMuPDF (fitz) for text extraction and pdf type detection.
+Uses pdfplumber + PyMuPDF for text extraction and pdf type detection.
 Encrypted PDFs are rejected (password-protected files are not supported).
 """
 
@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import fitz  # PyMuPDF
+import pymupdf
 import pdfplumber
 
 from app.config import Settings, get_settings
@@ -65,7 +65,7 @@ class PdfParser:
 
         # --- Encryption probe via PyMuPDF ---
         try:
-            fitz_doc = fitz.open(path)
+            fitz_doc = pymupdf.open(path)
         except Exception as exc:  # noqa: BLE001
             doc.error = f"Unable to open PDF: {exc}"
             return doc
@@ -95,7 +95,7 @@ class PdfParser:
         finally:
             fitz_doc.close()
 
-    def _extract_pages_fitz(self, fitz_doc: fitz.Document) -> list[PageContent]:
+    def _extract_pages_fitz(self, fitz_doc: pymupdf.Document) -> list[PageContent]:
         pages: list[PageContent] = []
         max_pages = min(fitz_doc.page_count, self.settings.max_pages)
         for i in range(max_pages):
@@ -121,7 +121,7 @@ class PdfParser:
                     )
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("fitz extraction failed on page %d: %s", i + 1, exc)
+                logger.warning("PyMuPDF extraction failed on page %d: %s", i + 1, exc)
                 pages.append(
                     PageContent(page_number=i + 1, text="", char_count=0, is_image_heavy=True)
                 )
@@ -200,8 +200,8 @@ class PdfParser:
         """Render a single page to PNG bytes (for OCR / preview)."""
         dpi = dpi or self.settings.ocr_dpi
         zoom = dpi / 72.0
-        matrix = fitz.Matrix(zoom, zoom)
-        doc = fitz.open(path)
+        matrix = pymupdf.Matrix(zoom, zoom)
+        doc = pymupdf.open(path)
         try:
             if doc.is_encrypted:
                 doc.authenticate(password or "")

@@ -104,9 +104,9 @@ class OcrService:
 
         path = Path(path)
         try:
-            import fitz
+            import pymupdf
 
-            doc = fitz.open(path)
+            doc = pymupdf.open(path)
             try:
                 if doc.is_encrypted:
                     doc.authenticate(password or "")

@@ -60,7 +60,7 @@ class Settings(BaseSettings):
 
     # AI agent — Google Gemini (UI corrections)
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-flash-latest"
+    gemini_model: str = "gemini-flash-lite-latest"
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
 
 
