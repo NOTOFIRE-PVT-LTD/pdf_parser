@@ -19,8 +19,9 @@ env/
 .env
 *.pem
 
-# Persist UI secrets/settings locally (API key). Keep out of git if desired.
-data/cache/ui_settings.json
+# Persist UI secrets locally. Keep out of git if desired.
+data/cache/
+data/uploads/
 
 # IDE / OS
 .idea/

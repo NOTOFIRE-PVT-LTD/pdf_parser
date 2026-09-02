@@ -51,6 +51,19 @@ class TenderInformation(BaseModel):
     earnest_money: str | None = None
     period_of_completion: str | None = None
     number_of_jv_member_allowed: str | None = None
+    # NIT header extras (IREPS-style) for flat Excel export
+    bidding_type: str | None = None
+    tender_type: str | None = None
+    contract_type: str | None = None
+    tender_doc_cost: str | None = None
+    bid_validity_days: str | None = None
+    bidding_system: str | None = None
+    pre_bid_conference: str | None = None
+    bidding_style: str | None = None
+    contract_category: str | None = None
+    published_date: str | None = None
+    reference_no: str | None = None
+    status: str | None = None
 
 
 class FinancialInfo(BaseModel):
@@ -102,6 +115,7 @@ class ProductItem(BaseModel):
     amount: str | None = None
     bidding_unit: str | None = None
     description: str | None = None
+    product_name: str | None = None
     schedule: str | None = None
     page_numbers: list[int] = Field(default_factory=list)
 
@@ -117,8 +131,8 @@ class ProductItem(BaseModel):
         return self.s_no
 
     @property
-    def product_name(self) -> str | None:
-        return self.description
+    def product_name_display(self) -> str | None:
+        return self.product_name or self.description
 
     @property
     def quantity(self) -> str | None:

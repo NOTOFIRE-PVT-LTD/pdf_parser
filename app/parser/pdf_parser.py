@@ -2,7 +2,7 @@
 PDF parsing service.
 
 Uses pdfplumber + PyMuPDF (fitz) for text extraction and pdf type detection.
-Encrypted PDFs surface a password-required status instead of crashing.
+Encrypted PDFs are rejected (password-protected files are not supported).
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ class PdfParser:
                 if not ok:
                     doc.pdf_type = PdfType.ENCRYPTED
                     doc.password_required = True
-                    doc.error = "PDF is encrypted. Please provide the password."
+                    doc.error = "This PDF is encrypted. Password-protected PDFs are not supported."
                     return doc
 
             doc.page_count = fitz_doc.page_count
