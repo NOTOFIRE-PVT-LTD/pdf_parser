@@ -264,7 +264,7 @@ class ProductExtractor:
                     basic_value=cell("basic_value"),
                     escalation=cell("escalation"),
                     amount=cell("amount"),
-                    bidding_unit=cell("bidding_unit") or "Rs.",
+                    bidding_unit=cell("bidding_unit"),
                     description=truncate(description, _DESC_MAX) if description else None,
                     schedule=schedule,
                     page_numbers=[table.page_number],
@@ -468,7 +468,7 @@ class ProductExtractor:
                             basic_value=rm_amt.group("basic"),
                             escalation=collapse_whitespace(rm_amt.group("escl")),
                             amount=rm_amt.group("amount"),
-                            bidding_unit=(rm_amt.groupdict().get("bidunit") or "Rs."),
+                            bidding_unit=rm_amt.groupdict().get("bidunit"),
                             schedule=schedule,
                         )
                         item.source_pos = region_offset + line_offsets[i]
@@ -948,7 +948,7 @@ class ProductExtractor:
                     basic_value=rm_amt.group("basic"),
                     escalation=collapse_whitespace(rm_amt.group("escl")),
                     amount=rm_amt.group("amount"),
-                    bidding_unit=(rm_amt.groupdict().get("bidunit") or "Rs."),
+                    bidding_unit=rm_amt.groupdict().get("bidunit"),
                     schedule=schedule,
                 )
             # "NS1 730.00 Day 954.00 ..." without S.No. on same line
@@ -982,7 +982,7 @@ class ProductExtractor:
                     basic_value=code_row.group("basic"),
                     escalation=collapse_whitespace(code_row.group("escl")),
                     amount=code_row.group("amount"),
-                    bidding_unit=(code_row.groupdict().get("bidunit") or "Rs."),
+                    bidding_unit=code_row.groupdict().get("bidunit"),
                     schedule=schedule,
                 )
         return None
@@ -1008,7 +1008,7 @@ class ProductExtractor:
             basic_value=m.group("basic"),
             escalation=collapse_whitespace(m.group("escl")),
             amount=m.group("amount"),
-            bidding_unit=(m.groupdict().get("bidunit") or "Rs."),
+            bidding_unit=m.groupdict().get("bidunit"),
             schedule=schedule,
         )
 
@@ -1096,7 +1096,7 @@ class ProductExtractor:
             basic_value=m.group("basic"),
             escalation=collapse_whitespace(m.group("escl")),
             amount=m.group("amount"),
-            bidding_unit=(m.groupdict().get("bidunit") or "Rs."),
+            bidding_unit=m.groupdict().get("bidunit"),
             schedule=schedule,
             page_numbers=[page] if page else [],
         )
@@ -1141,7 +1141,7 @@ class ProductExtractor:
                     re.sub(r"(?i)at\s*par", "AT Par", p.escalation)
                 )
             if not p.bidding_unit or str(p.bidding_unit).lower() in {"none", "null"}:
-                p.bidding_unit = "Rs."
+                p.bidding_unit = None
             if p.description:
                 p.description = p.description.lstrip("-–— ").strip()
             if p.schedule:
@@ -1383,6 +1383,7 @@ class ProductExtractor:
             "amount",
             "bidding_unit",
             "schedule",
+            "product_name",
         ):
             if not getattr(a, attr) and getattr(b, attr):
                 setattr(a, attr, getattr(b, attr))

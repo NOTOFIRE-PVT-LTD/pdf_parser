@@ -376,11 +376,31 @@ class FieldExtractor:
             "period_of_completion": r"period\s+of\s+completion",
             "number_of_jv_member_allowed": r"number\s+of\s+jv\s+member(?:s)?\s+allowed",
             "closing_date_time": r"tender\s*closing\s*date(?:\s*time)?|closing\s*date(?:\s*/?\s*time)?",
+            "bidding_type": r"bidding\s*type",
+            "tender_type": r"tender\s*type",
+            "contract_type": r"contract\s*type",
+            "tender_doc_cost": r"tender\s*doc\.?\s*cost(?:\s*\(?\s*rs\.?\s*\)?)?",
+            "bid_validity_days": r"validity\s+of\s+offer(?:\s*\(?\s*days?\s*\)?)?",
+            "bidding_system": r"bidding\s*system",
+            "pre_bid_conference": r"pre-?bid\s+conference(?:\s+required)?",
+            "bidding_style": r"bidding\s*style",
+            "contract_category": r"contract\s*category",
+            "published_date": r"date\s*time\s*of\s*uploading\s*tender|uploading\s*tender",
+            "reference_no": r"reference\s*(?:no\.?|number)",
+            "status": r"tender\s*status|status\s*of\s*tender",
         }
         for field, label in pairs.items():
-            hint = "amount" if field in {"advertised_value", "earnest_money"} else None
+            hint = "amount" if field in {
+                "advertised_value",
+                "earnest_money",
+                "tender_doc_cost",
+            } else None
             if field == "closing_date_time":
                 hint = "datetime"
+            if field == "published_date":
+                hint = "datetime"
+            if field == "bid_validity_days":
+                hint = "days"
             # Same-line: Label <spaces> Value  (common in 4-column NIT tables)
             pm = re.search(
                 rf"(?im)(?:{label})\s*[:\-–]?\s+(?P<val>\S[^\n]*?)(?=\s{{2,}}[A-Z][a-z]|\s{{2,}}Are\s|\s{{2,}}Number\s|\n|$)",
@@ -398,12 +418,7 @@ class FieldExtractor:
         return out
 
     def _extract_from_nit_tables(self, tables: list) -> dict[str, str | None]:
-        """
-        Read NIT HEADER style tables where label and value are adjacent cells.
-
-        Example row: ['Name of Work', 'Appointment of Project Supervision...']
-        Or 4-col: ['Advertised Value', '100877479.68', 'Tendering Section', 'DY.CSTE/W']
-        """
+        """Read NIT header tables — label cell followed by value cell."""
         out: dict[str, str | None] = {}
         label_map = [
             ("name_of_work", re.compile(r"(?i)^name\s+of\s+(?:the\s+)?work$")),
@@ -419,30 +434,48 @@ class FieldExtractor:
             rows = [table.headers] + table.rows if table.headers else table.rows
             for row in rows:
                 cells = [collapse_whitespace(str(c or "")) or "" for c in row]
-                for i, cell in enumerate(cells):
-                    for field, pattern in label_map:
-                        if not pattern.search(cell.strip()):
-                            continue
-                        # Value is usually the next non-empty cell
-                        value = None
-                        for j in range(i + 1, len(cells)):
-                            if cells[j].strip():
-                                value = cells[j].strip()
-                                break
-                        if not value:
-                            continue
-                        if field in {"advertised_value", "earnest_money"}:
-                            value = self._refine_value(value, "amount")
-                        elif field == "closing_date_time":
-                            value = self._refine_value(value, "datetime")
-                        if value and not self._is_placeholder(value):
-                            # Keep longest name_of_work
-                            if field == "name_of_work" and out.get(field):
-                                if len(value) > len(out[field] or ""):
-                                    out[field] = truncate(value, 1000)
-                            elif not out.get(field):
-                                out[field] = truncate(value, 1000 if field == "name_of_work" else 500)
+                self._apply_nit_row(cells, label_map, out)
         return out
+
+    def _apply_nit_row(
+        self,
+        cells: list[str],
+        label_map: list[tuple[str, re.Pattern[str]]],
+        out: dict[str, str | None],
+    ) -> None:
+        for i, cell in enumerate(cells):
+            field = self._nit_field_for_cell(cell.strip(), label_map)
+            if not field:
+                continue
+            value = self._next_nonempty_cell(cells, i + 1)
+            if not value or self._is_placeholder(value):
+                continue
+            if field in {"advertised_value", "earnest_money"}:
+                value = self._refine_value(value, "amount")
+            elif field == "closing_date_time":
+                value = self._refine_value(value, "datetime")
+            if field == "name_of_work" and out.get(field):
+                if len(value) > len(out[field] or ""):
+                    out[field] = truncate(value, 1000)
+            elif not out.get(field):
+                limit = 1000 if field == "name_of_work" else 500
+                out[field] = truncate(value, limit)
+
+    @staticmethod
+    def _nit_field_for_cell(
+        cell: str, label_map: list[tuple[str, re.Pattern[str]]]
+    ) -> str | None:
+        for field, pattern in label_map:
+            if pattern.search(cell):
+                return field
+        return None
+
+    @staticmethod
+    def _next_nonempty_cell(cells: list[str], start: int) -> str | None:
+        for j in range(start, len(cells)):
+            if cells[j].strip():
+                return cells[j].strip()
+        return None
 
     # ------------------------------------------------------------------
     # Internals
@@ -554,6 +587,11 @@ class FieldExtractor:
             )
             if m:
                 return m.group(0).strip()
+            return value
+        if value_hint == "days":
+            m = re.search(r"\b(\d{1,4})\b", value)
+            if m:
+                return m.group(1)
             return value
         return value
 

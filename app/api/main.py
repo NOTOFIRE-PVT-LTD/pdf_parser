@@ -1,8 +1,7 @@
 """
 Optional FastAPI HTTP API for Tender Parser.
 
-Streamlit is the preferred V1 UI; this API enables programmatic access
-and a future React frontend without changing core services.
+Streamlit is the primary UI; this API enables programmatic access.
 """
 
 from __future__ import annotations
@@ -11,12 +10,12 @@ import shutil
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from app.config import get_settings
-from app.models.schemas import ExtractionStatus
+from app.models.schemas import ExtractionStatus, TenderResult
 from app.services.export_service import ExportService
 from app.services.pipeline import TenderPipeline
 
@@ -36,14 +35,11 @@ app.add_middleware(
 
 pipeline = TenderPipeline(settings)
 exporter = ExportService(settings)
-
-# In-memory result cache for download endpoints (V1)
-_RESULTS: dict[str, object] = {}
+_RESULTS: dict[str, TenderResult] = {}
 
 
 @app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
-    """This is a JSON API with no page of its own — send browsers to the interactive docs."""
     return RedirectResponse(url="/docs")
 
 
@@ -55,8 +51,7 @@ def health() -> dict:
 @app.post("/api/v1/parse")
 async def parse_tender(
     file: UploadFile = File(...),
-    password: str | None = Form(default=None),
-    enrich_with_ai: bool = Form(default=False),
+) -> dict:
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
@@ -66,22 +61,12 @@ async def parse_tender(
         shutil.copyfileobj(file.file, fh)
 
     try:
-        result = pipeline.process(dest, password=password or None, enrich_with_ai=enrich_with_ai)
+        result = pipeline.process(dest)
     finally:
-        # The extracted result is cached in _RESULTS; the uploaded copy on disk
-        # is no longer needed and would otherwise accumulate indefinitely.
         dest.unlink(missing_ok=True)
+
     _RESULTS[job_id] = result
 
-    if result.status == ExtractionStatus.PASSWORD_REQUIRED:
-        return JSONResponse(
-            status_code=401,
-            content={
-                "job_id": job_id,
-                "status": result.status.value,
-                "error": result.meta.error if result.meta else "Password required",
-            },
-        )
     if result.status == ExtractionStatus.OCR_FAILED:
         return JSONResponse(
             status_code=422,
@@ -105,7 +90,7 @@ async def parse_tender(
 
 
 @app.get("/api/v1/export/{job_id}/{fmt}")
-def export_result(job_id: str, fmt: str):
+def export_result(job_id: str, fmt: str) -> Response:
     result = _RESULTS.get(job_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Job not found. Parse a PDF first.")
@@ -113,19 +98,19 @@ def export_result(job_id: str, fmt: str):
     fmt = fmt.lower()
     if fmt == "json":
         return Response(
-            content=exporter.to_json_bytes(result),  # type: ignore[arg-type]
+            content=exporter.to_json_bytes(result),
             media_type="application/json",
             headers={"Content-Disposition": f'attachment; filename="{job_id}.json"'},
         )
     if fmt in {"xlsx", "excel"}:
         return Response(
-            content=exporter.to_excel_bytes(result),  # type: ignore[arg-type]
+            content=exporter.to_excel_bytes(result),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": f'attachment; filename="{job_id}.xlsx"'},
         )
     if fmt == "csv":
         return Response(
-            content=exporter.to_csv_bytes(result, which="products"),  # type: ignore[arg-type]
+            content=exporter.to_csv_bytes(result, which="products"),
             media_type="text/csv",
             headers={"Content-Disposition": f'attachment; filename="{job_id}_products.csv"'},
         )

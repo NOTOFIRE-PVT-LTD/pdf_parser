@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     upload_dir: Path = _DATA_ROOT / "uploads"
     export_dir: Path = _DATA_ROOT / "exports"
     cache_dir: Path = _DATA_ROOT / "cache"
+    learnings_file: Path = _DATA_ROOT / "cache" / "product_name_learnings.json"
 
     # PDF / OCR
     # Characters below this page density → treat page as scanned / image-only
@@ -55,28 +56,12 @@ class Settings(BaseSettings):
 
     # Extraction
     max_pages: int = 500
-    # Allow single-row continuation tables after header
     table_min_rows: int = 1
 
-    # Optional AI backends
-    ai_provider: str = "none"  # none | ollama | openai | anthropic | gemini
-    ai_enabled: bool = False
-    openai_api_key: str | None = None
-    anthropic_api_key: str | None = None
+    # AI agent — Google Gemini (UI corrections)
     gemini_api_key: str | None = None
-    openai_model: str = "gpt-4o-mini"
-    anthropic_model: str = "claude-3-5-haiku-latest"
     gemini_model: str = "gemini-flash-latest"
-    ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3.2"
-
-    # Chunked AI extraction: when AI is enabled, the whole document is split
-    # into page-group chunks and each one is sent to the model in turn, so a
-    # large multi-hundred-page tender gets fully read instead of only its
-    # first ~28k characters. Tune down for slower/cheaper models, up for
-    # models with large context windows.
-    ai_chunk_max_pages: int = 6
-    ai_chunk_max_chars: int = 12000
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
 
 
 @lru_cache
@@ -87,3 +72,9 @@ def get_settings() -> Settings:
     settings.export_dir.mkdir(parents=True, exist_ok=True)
     settings.cache_dir.mkdir(parents=True, exist_ok=True)
     return settings
+
+
+def reload_settings() -> Settings:
+    """Clear cache after .env changes."""
+    get_settings.cache_clear()
+    return get_settings()

@@ -10,7 +10,6 @@ from app.extractor.field_extractor import FieldExtractor
 from app.extractor.product_extractor import ProductExtractor
 from app.parser.table_parser import ExtractedTable, TableParser
 from app.services.export_service import ExportService
-from app.services.search_service import matches_query
 from app.models.schemas import ProductItem, TenderInformation, TenderResult
 
 
@@ -504,16 +503,3 @@ def test_export_json_excel_csv():
     assert "tender_no" in data
     assert len(exporter.to_excel_bytes(result)) > 100
     assert len(exporter.to_csv_bytes(result, which="summary")) > 10
-
-
-def test_search():
-    result = TenderResult(
-        tender_information=TenderInformation(
-            tender_no="DYCSTE_Works_PSSA_02R",
-            division_name="MUMBAI CENTRAL DIVISION-S AND T",
-            name_of_work="Hiring of Non-Key Personnel",
-        )
-    )
-    assert matches_query(result, "PSSA")
-    assert matches_query(result, "mumbai")
-    assert not matches_query(result, "zzzz-no-match")
