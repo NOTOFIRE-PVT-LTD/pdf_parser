@@ -1,8 +1,8 @@
 """
 Export service — JSON, Excel, CSV.
 
-Flat Excel: one row per BOQ line. Column order is fixed; each cell is filled
-only from parsed PDF fields (null when not found — never invented).
+Flat sheet: one row per BOQ line. Column order is fixed. Every cell comes from
+parsed NIT/PDF fields only — missing values stay null (never invented).
 """
 
 from __future__ import annotations
@@ -91,6 +91,21 @@ class ExportService:
             return None
         return value
 
+    @staticmethod
+    def _name_from_pdf(description: str | None, product_name: str | None) -> str | None:
+        """Export a product name only if it is grounded in the PDF description."""
+        name = ExportService._cell(product_name)
+        desc = (description or "").lower()
+        if not name or not desc:
+            return None
+        nl = str(name).lower().strip()
+        if nl in desc:
+            return name
+        words = [w for w in nl.split() if len(w) > 2]
+        if words and sum(1 for w in words if w in desc) / len(words) >= 0.7:
+            return name
+        return None
+
     def to_json_str(self, result: TenderResult, indent: int = 2) -> str:
         return json.dumps(result.to_export_dict(), indent=indent, ensure_ascii=False)
 
@@ -101,18 +116,30 @@ class ExportService:
         return self.to_combined_excel_bytes([result])
 
     def to_combined_excel_bytes(self, results: list[TenderResult]) -> bytes:
-        rows: list[dict[str, Any]] = []
-        for result in results:
-            rows.extend(self.build_flat_rows(result))
-        if not rows:
-            rows = [{col: None for col in FLAT_EXCEL_COLUMNS}]
-        rows = [self._sanitize_row(r) for r in rows]
+        rows = self._flat_rows(results)
         buffer = io.BytesIO()
         pd.DataFrame(rows, columns=FLAT_EXCEL_COLUMNS).to_excel(
             buffer, sheet_name="Tender Data", index=False, engine="openpyxl"
         )
         buffer.seek(0)
         return buffer.read()
+
+    def to_combined_csv_bytes(self, results: list[TenderResult]) -> bytes:
+        """Same portal columns as Excel — full data in one CSV download."""
+        rows = self._flat_rows(results)
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=FLAT_EXCEL_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+        return buffer.getvalue().encode("utf-8-sig")
+
+    def _flat_rows(self, results: list[TenderResult]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for result in results:
+            rows.extend(self.build_flat_rows(result))
+        if not rows:
+            rows = [{col: None for col in FLAT_EXCEL_COLUMNS}]
+        return [self._sanitize_row(r) for r in rows]
 
     def build_flat_rows(self, result: TenderResult) -> list[dict[str, Any]]:
         header = self._tender_header(result)
@@ -121,15 +148,17 @@ class ExportService:
         return [self._product_row(header, product) for product in result.products]
 
     def _tender_header(self, result: TenderResult) -> dict[str, Any]:
-        """Tender-level columns — each mapped 1:1 from parsed NIT header fields."""
+        """Tender-level columns — 1:1 from parsed NIT fields; null if absent."""
         info = result.tender_information
+        work = self._cell(info.name_of_work)
         return {
-            "title": self._cell(info.name_of_work),
+            "title": work,
             "tenderNo": self._cell(info.tender_no),
+            # Never copy tenderNo into referenceNo — only if PDF had it
             "referenceNo": self._cell(info.reference_no),
-            "description": self._cell(info.name_of_work),
+            "description": work,
             "zone": self._cell(info.zone),
-            "railway": self._cell(info.zone),
+            "railway": self._cell(info.railway),
             "division": self._cell(info.division_name),
             "status": self._cell(info.status),
             "advertisedValue": self._cell(info.advertised_value),
@@ -151,9 +180,16 @@ class ExportService:
         }
 
     def _product_row(self, header: dict[str, Any], product: ProductItem) -> dict[str, Any]:
-        """Item-level columns — BOQ row + description split from PDF text only."""
+        """Item-level columns — BOQ values + description-derived fields from PDF text only."""
         full_desc = normalize_product_description(product.description)
-        name = self._cell(product.product_name)
+        name = self._name_from_pdf(full_desc, product.product_name)
+        # Specs / period are substrings of the PDF description, or null
+        specs = extract_item_specs(full_desc)
+        period = extract_item_period(full_desc)
+        if specs and full_desc and specs.lower() not in full_desc.lower():
+            specs = None
+        if period and full_desc and period.lower() not in full_desc.lower():
+            period = None
 
         row = dict(header)
         row.update(
@@ -168,10 +204,10 @@ class ExportService:
                 "itemTotal": self._cell(product.amount),
                 "itemBaseValue": self._cell(product.basic_value),
                 "itemCategory": self._cell(product.schedule),
-                "itemSpecs": self._cell(extract_item_specs(full_desc)),
+                "itemSpecs": self._cell(specs),
                 "productName": name,
                 "itemDescription": self._cell(full_desc),
-                "itemPeriod": self._cell(extract_item_period(full_desc)),
+                "itemPeriod": self._cell(period),
                 "schedule": self._cell(product.schedule),
             }
         )
@@ -185,13 +221,10 @@ class ExportService:
         return row
 
     def to_csv_bytes(self, result: TenderResult, which: str = "products") -> bytes:
-        buffer = io.StringIO()
         if which == "products":
-            rows = [self._sanitize_row(r) for r in self.build_flat_rows(result)]
-            writer = csv.DictWriter(buffer, fieldnames=FLAT_EXCEL_COLUMNS, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
-        elif which == "documents":
+            return self.to_combined_csv_bytes([result])
+        buffer = io.StringIO()
+        if which == "documents":
             writer = csv.DictWriter(buffer, fieldnames=["document"])
             writer.writeheader()
             for d in result.documents_required:

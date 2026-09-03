@@ -96,6 +96,9 @@ class FieldExtractor:
             data["division_name"] = div
         if zone and not data.get("zone"):
             data["zone"] = zone
+        # Railway only when PDF text actually names a railway / RLY
+        if not data.get("railway"):
+            data["railway"] = self._extract_railway(text, zone=data.get("zone") or zone)
 
         # Closing Date/Time — always prefer dedicated parser
         closing = self._extract_closing_datetime(text)
@@ -137,6 +140,8 @@ class FieldExtractor:
             data["division_name"] = self._clean_division(data["division_name"])
         if data.get("zone"):
             data["zone"] = self._clean_zone(data["zone"])
+        if data.get("railway"):
+            data["railway"] = self._clean_zone(data["railway"]) or data["railway"]
 
         return TenderInformation(**{k: data.get(k) for k in TenderInformation.model_fields})
 
@@ -243,6 +248,26 @@ class FieldExtractor:
                     continue
                 return div, zone
         return None, None
+
+    def _extract_railway(self, text: str, *, zone: str | None = None) -> str | None:
+        """
+        Railway name from PDF only — never invent.
+
+        Prefer an explicit 'Railway' label; else use zone when it clearly
+        names a railway (… RLY / … Railway).
+        """
+        labeled = self._find_labeled_value(
+            text,
+            [r"railway\s*(?:name)?", r"name\s+of\s+(?:the\s+)?railway"],
+        )
+        if labeled:
+            cleaned = collapse_whitespace(labeled)
+            if cleaned and "page" not in cleaned.lower():
+                return truncate(cleaned, 200)
+
+        if zone and re.search(r"(?i)\b(?:rly|railway)\b", zone):
+            return zone
+        return None
 
     def _extract_closing_datetime(self, text: str) -> str | None:
         m = re.search(

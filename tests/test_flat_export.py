@@ -14,6 +14,7 @@ def test_flat_excel_rows_match_portal_columns():
             tender_no="SDSTE-LCGATE-05",
             division_name="HOWRAH DIVISION",
             zone="EASTERN RLY",
+            railway="EASTERN RLY",
             advertised_value="1000000.00",
             earnest_money="20000.00",
             period_of_completion="12 Months",
@@ -43,7 +44,9 @@ def test_flat_excel_rows_match_portal_columns():
     row = rows[0]
     assert set(FLAT_EXCEL_COLUMNS).issubset(set(row.keys()))
     assert row["tenderNo"] == "SDSTE-LCGATE-05"
+    assert row["railway"] == "EASTERN RLY"
     assert row["productName"] == "Micro Processor based Remote Terminal Unit (RTU)"
     assert row["itemDescription"] == "Supply of Micro Processor based Remote Terminal Unit (RTU)"
     assert row["productName"] != row["itemDescription"]
     assert len(exporter.to_excel_bytes(result)) > 200
+    assert len(exporter.to_combined_csv_bytes([result])) > 50

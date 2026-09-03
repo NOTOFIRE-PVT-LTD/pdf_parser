@@ -24,7 +24,6 @@ from app.services.ai_correction import ChatMessage, chat_ai, resolve_ai_provider
 from app.services.chat_store import load_chats, save_chats
 from app.services.export_service import ExportService
 from app.services.pipeline import TenderPipeline
-from app.services.product_sanitize import _renumber_sequential
 from app.services.ui_prefs import load_prefs, save_prefs
 
 settings = reload_settings()
@@ -433,10 +432,10 @@ def _all_products(chat: dict) -> list:
 
 
 def _product_rows(products: list) -> list[dict]:
-    _renumber_sequential(products)
+    # Display only — do not mutate PDF serial numbers
     return [
         {
-            "S.No.": str(i + 1),
+            "S.No.": p.s_no or str(i + 1),
             "Product Name": p.product_name,
             "Description": p.description,
             "Qty": p.item_qty,
@@ -814,21 +813,41 @@ def _render_message(msg: dict, chat: dict, idx: int) -> None:
         ]
         if len(results) == 1:
             stem = Path(results[0].meta.filename if results[0].meta else "tender").stem
-            st.download_button(
-                "Download Excel",
-                data=exporter.to_excel_bytes(results[0]),
-                file_name=f"{stem}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"dl_{chat['id']}_{idx}",
-            )
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                st.download_button(
+                    "Download Excel",
+                    data=exporter.to_excel_bytes(results[0]),
+                    file_name=f"{stem}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_xlsx_{chat['id']}_{idx}",
+                )
+            with dl2:
+                st.download_button(
+                    "Download CSV",
+                    data=exporter.to_csv_bytes(results[0], which="products"),
+                    file_name=f"{stem}.csv",
+                    mime="text/csv",
+                    key=f"dl_csv_{chat['id']}_{idx}",
+                )
         elif results:
-            st.download_button(
-                "Download all Excel",
-                data=exporter.to_combined_excel_bytes(results),
-                file_name="tenders_export.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"dl_{chat['id']}_{idx}",
-            )
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                st.download_button(
+                    "Download all Excel",
+                    data=exporter.to_combined_excel_bytes(results),
+                    file_name="tenders_export.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_xlsx_{chat['id']}_{idx}",
+                )
+            with dl2:
+                st.download_button(
+                    "Download all CSV",
+                    data=exporter.to_combined_csv_bytes(results),
+                    file_name="tenders_export.csv",
+                    mime="text/csv",
+                    key=f"dl_csv_{chat['id']}_{idx}",
+                )
 
 
 def _build_pdf_reply(chat: dict, results: list[TenderResult]) -> dict:
@@ -866,7 +885,8 @@ def _build_pdf_reply(chat: dict, results: list[TenderResult]) -> dict:
         lines.append(f"{len(failed)} file(s) had issues and were skipped.")
     lines.append("")
     lines.append(
-        "Tell me what to fix (e.g. clean names, remove work rows), or download Excel below."
+        "Tell me what to fix (e.g. clean names, remove work rows), "
+        "or download Excel / CSV below (same full portal columns)."
     )
     return {
         "role": "assistant",

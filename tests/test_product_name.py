@@ -137,15 +137,53 @@ def test_recheck_strips_leftover_scope():
     assert fixed == "Fault isolator"
 
 
-def test_sanitize_renumbers_sequential_across_schedules():
+def test_sanitize_preserves_pdf_serial_numbers():
     items = sanitize_products([
-        ProductItem(s_no="1", item_qty="1", amount="100", description="Item A"),
-        ProductItem(s_no="2", item_qty="1", amount="200", description="Item B"),
-        ProductItem(s_no="6", item_qty="1", amount="300", description="Item C"),
-        ProductItem(s_no="1", item_qty="1", amount="400", description="Item D", schedule="Schedule B"),
-        ProductItem(s_no="3", item_qty="1", amount="500", description="Item E", schedule="Schedule B"),
+        ProductItem(s_no="1", item_qty="1", amount="100", description="Supply of Widget Alpha"),
+        ProductItem(s_no="2", item_qty="1", amount="200", description="Supply of Widget Beta"),
+        ProductItem(s_no="6", item_qty="1", amount="300", description="Supply of Widget Gamma"),
+        ProductItem(
+            s_no="1",
+            item_qty="1",
+            amount="400",
+            description="Supply of Widget Delta",
+            schedule="Schedule B",
+        ),
+        ProductItem(
+            s_no="3",
+            item_qty="1",
+            amount="500",
+            description="Supply of Widget Epsilon",
+            schedule="Schedule B",
+        ),
     ])
-    assert [p.s_no for p in items] == ["1", "2", "3", "4", "5"]
+    serials = [p.s_no for p in items]
+    # PDF serials kept — never rewrite whole list to fabricated 1..N
+    assert serials != ["1", "2", "3", "4", "5"]
+    assert set(serials) == {"1", "2", "3", "6"}
+    assert serials.count("1") == 2  # schedule restart allowed
+
+
+def test_sanitize_fills_missing_serial_only():
+    items = sanitize_products([
+        ProductItem(
+            s_no=None,
+            item_qty="1",
+            amount="100",
+            description="Supply of Missing Serial Widget",
+        ),
+        ProductItem(
+            s_no="9",
+            item_qty="1",
+            amount="200",
+            description="Supply of Kept Serial Widget",
+        ),
+    ])
+    by_name = {p.product_name: p.s_no for p in items}
+    assert by_name.get("Kept Serial Widget") == "9"
+    # Missing serial gets a document-order fill-in only
+    assert by_name.get("Missing Serial Widget") not in {None, "", "9"}
+    assert str(by_name.get("Missing Serial Widget")).isdigit()
 
 
 def test_excel_export_name_vs_description_columns():

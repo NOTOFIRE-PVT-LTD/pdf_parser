@@ -107,7 +107,9 @@ def sanitize_products(raw_products: list[Any]) -> list[ProductItem]:
 
 
 def _renumber_sequential(items: list[ProductItem]) -> list[ProductItem]:
-    """Assign 1..N in final document order (fixes per-schedule restarts and gaps)."""
+    """Fill missing S.No. only — never overwrite a serial taken from the PDF."""
     for idx, item in enumerate(items, start=1):
-        item.s_no = str(idx)
+        sno = str(item.s_no or "").strip()
+        if not sno:
+            item.s_no = str(idx)
     return items

@@ -47,6 +47,7 @@ class TenderInformation(BaseModel):
     closing_date_time: str | None = None
     division_name: str | None = None
     zone: str | None = None
+    railway: str | None = None  # only when PDF states railway / RLY explicitly
     advertised_value: str | None = None
     earnest_money: str | None = None
     period_of_completion: str | None = None
