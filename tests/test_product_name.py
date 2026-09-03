@@ -173,6 +173,26 @@ def test_excel_export_name_vs_description_columns():
     assert row["productName"] != row["itemDescription"]
 
 
+def test_user_style_product_names():
+    assert extract_product_name(
+        "Supply, installation, testing and commissioning of Relay module with "
+        "backbox and all other accessories as per RDSO/SPN/217/2025 ver-3.1 or latest. "
+        "Inspection: RDSO"
+    ) == "Relay module with backbox"
+    assert extract_product_name(
+        "Supply, installation, testing and commissioning of GSM module for Control "
+        "panel with backbox and all other accessories as per RDSO"
+    ) == "GSM module for Control panel"
+    assert extract_product_name(
+        "Automatic Fire Ball for Fire-Extinguishing of Medium size - the weight of "
+        "the agent is not less than 1.0 kg. Inspection: RDSO"
+    ) == "Automatic Fire Ball for Fire-Extinguishing"
+    assert extract_product_name(
+        "Supply of heavy duty Heat Gun of minimum 2000 Watt with LCD display "
+        "(for temperature) for testing of heat sensors in S&T installation. Make-BOSCH"
+    ) == "heavy duty Heat Gun of minimum 2000 Watt with LCD display (for temperature)"
+
+
 def test_civil_work_paragraphs_are_not_products():
     work = (
         "RE-INSTATEMENT OF PLATFORM AND REPAIRING TO ORIGINAL STATE AFTER CABLE LAYING, "
@@ -188,16 +208,3 @@ def test_civil_work_paragraphs_are_not_products():
     assert is_work_description(work)
     assert is_work_description(trench)
     assert not is_work_description("Supply of 6 Quad Jelly Filled Cable 0.9mm")
-
-    items = sanitize_products([
-        ProductItem(s_no="1", description=work, item_qty="10", unit_rate="100", amount="1000"),
-        ProductItem(
-            s_no="2",
-            description="Supply of Disconnect Terminal Block",
-            item_qty="5",
-            unit_rate="50",
-            amount="250",
-        ),
-    ])
-    assert len(items) == 1
-    assert items[0].product_name == "Disconnect Terminal Block"

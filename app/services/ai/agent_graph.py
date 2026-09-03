@@ -1,4 +1,4 @@
-"""LangGraph agent — general chat + tender tools + RAG memory."""
+"""LangGraph agent — chat + tender fixes, driven by saved user instructions."""
 
 from __future__ import annotations
 
@@ -13,57 +13,37 @@ from langgraph.graph import END, StateGraph
 from app.config import Settings, get_settings
 from app.models.schemas import ProductItem
 from app.services.ai.gemini_client import generate_with_fallback
+from app.services.ai.instruction_memory import add_instruction, format_for_prompt
 from app.services.ai.memory_store import get_memory_store
 from app.services.ai.mistral_client import chat_completion
-from app.services.ai.token_budget import (
-    clip_text,
-    compact_history,
-    looks_like_tender_task,
-)
+from app.services.ai.token_budget import clip_text, compact_history, looks_like_tender_task
 from app.services.name_learning import get_name_learning
 from app.services.product_sanitize import _renumber_sequential
-from app.utils.product_name import is_work_description, recheck_product_name
 
 logger = logging.getLogger(__name__)
 
-_CHAT_SYSTEM = """You are Notofire AI — a friendly, capable assistant (like Claude).
-You can talk about anything: coding, ideas, explanations, general chat.
-You also help with Indian Railway / tender BOQ PDFs when the user uploads them:
-extract products, clean names, fix rows, export Excel.
+_CHAT_BASE = """You are Notofire AI — a capable assistant.
+Help with general chat and Indian Railway / tender BOQ product extraction when relevant.
+Match the language of the user's latest message (English / Hindi / Hinglish).
+Do not ask to upload a PDF again if products are already loaded.
+Follow SAVED USER INSTRUCTIONS when present — they override defaults.
+Keep replies concise."""
 
-LANGUAGE (critical — follow strictly):
-- Detect the language of the user's LATEST message and reply ONLY in that language.
-- If the user writes in English → reply in clear English only (no Hindi words, no Hinglish).
-- If the user writes in Hindi (Devanagari) → reply in Hindi only.
-- If the user writes in Hinglish (mixed Hindi+English roman script) → reply in Hinglish.
-- Do not default to Hinglish. Match the user exactly.
-
-Other rules:
-- Reply naturally. Do NOT push PDF upload unless they ask about tenders/PDFs.
-- Keep answers concise unless they want detail.
-- If tender product rows are in context and they ask to fix them, help.
-- Use remembered context snippets when relevant.
-"""
-
-_FIX_SYSTEM = """You are Notofire AI fixing tender BOQ extraction rows.
+_FIX_BASE = """You fix tender BOQ product rows.
 Return ONLY valid JSON (no markdown fences):
-{"reply":"short friendly answer","changes":[{"index":0,"product_name":"...","remove":false}],"summary":"one line or empty"}
-
-LANGUAGE for "reply" and "summary":
-- Match the user's latest message language exactly.
-- English message → English reply. Hindi → Hindi. Hinglish → Hinglish.
-- Never default to Hinglish.
+{"reply":"short answer","changes":[{"index":0,"product_name":"...","remove":false}],"summary":"one line"}
 
 Rules:
-- product_name MUST use words from that row's description only
-- Remove scope phrases: supply, installation, testing, commissioning, etc.
-- Set remove=true for junk OR WORK rows (not products): excavation/trench/refilling,
-  platform/track reinstatement, payment notes, "work includes", civil execution paragraphs.
-  Keep ONLY actual supplyable materials / equipment / products.
-- When user says items are work (not products), remove those rows (remove=true).
-- Include only rows that need a change; [] if none
-- Follow the user instruction; use chat history for follow-ups
-"""
+- Follow SAVED USER INSTRUCTIONS strictly for what counts as a product and how names look.
+- product_name must use words from that row's description only — never invent.
+- remove=true for rows that are not real products per user instructions.
+- Include only rows that need a change; [] if none.
+- Match reply language to the user."""
+
+_DISTILL = """You extract durable rules from a user message for a tender product AI.
+Return ONLY JSON: {"save":true,"rule":"..."} or {"save":false,"rule":""}
+save=true only if the message teaches a reusable rule (naming style, what to exclude, etc.).
+rule must be one clear English instruction. If greeting/one-off question → save=false."""
 
 
 class AgentState(TypedDict, total=False):
@@ -80,14 +60,21 @@ class AgentState(TypedDict, total=False):
     chat_id: str
 
 
+def _with_instructions(base: str) -> str:
+    block = format_for_prompt()
+    if not block:
+        return base
+    return f"{base}\n\n{block}"
+
+
 def _compact_rows(products: list[ProductItem]) -> list[dict]:
     rows = []
     for i, p in enumerate(products):
         rows.append({
             "index": i,
             "s_no": p.s_no,
-            "product_name": clip_text(p.product_name or "", 120),
-            "description": clip_text(p.description or "", 220),
+            "product_name": clip_text(p.product_name or "", 80),
+            "description": clip_text(p.description or "", 140),
             "qty": p.item_qty,
             "amount": p.amount,
         })
@@ -124,7 +111,6 @@ def _call_llm(
     json_mode: bool,
     temperature: float,
 ) -> tuple[str, str]:
-    """Returns (content, provider). Prefers Mistral, falls back to Gemini on 429."""
     provider = "mistral" if settings.mistral_api_key else "gemini"
     if not settings.mistral_api_key and not settings.gemini_api_key:
         raise ValueError("no_key")
@@ -139,7 +125,7 @@ def _call_llm(
                     base_url=settings.mistral_base_url,
                     temperature=temperature,
                     json_mode=json_mode,
-                    timeout=90,
+                    timeout=120,
                 ),
                 "mistral",
             )
@@ -148,7 +134,6 @@ def _call_llm(
                 raise
             provider = "gemini"
 
-    # Gemini path — fold messages into one prompt
     system = ""
     parts = []
     for m in messages:
@@ -157,7 +142,7 @@ def _call_llm(
         else:
             parts.append(f"{m['role']}: {m['content']}")
     payload = {
-        "system_instruction": {"parts": [{"text": system or _CHAT_SYSTEM}]},
+        "system_instruction": {"parts": [{"text": system or _CHAT_BASE}]},
         "contents": [{"role": "user", "parts": [{"text": "\n".join(parts)}]}],
         "generationConfig": {
             "temperature": temperature,
@@ -169,10 +154,35 @@ def _call_llm(
         settings.gemini_model,
         payload,
         base_url=settings.gemini_base_url,
-        timeout=75,
+        timeout=90,
         model_cache=[],
     )
     return raw, "gemini"
+
+
+def capture_instruction_from_user(user_text: str, settings: Settings | None = None) -> None:
+    """Distill a lasting rule from the user message and save it for future runs."""
+    text = (user_text or "").strip()
+    if len(text) < 20:
+        return
+    settings = settings or get_settings()
+    if not settings.mistral_api_key and not settings.gemini_api_key:
+        return
+    try:
+        raw, _ = _call_llm(
+            settings,
+            [
+                {"role": "system", "content": _DISTILL},
+                {"role": "user", "content": text[:2000]},
+            ],
+            json_mode=True,
+            temperature=0.0,
+        )
+        parsed = _parse_json(raw)
+        if parsed.get("save") and parsed.get("rule"):
+            add_instruction(str(parsed["rule"]), source="distilled")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("instruction distill skipped: %s", exc)
 
 
 def node_retrieve(state: AgentState) -> AgentState:
@@ -244,36 +254,33 @@ def node_chat(state: AgentState) -> AgentState:
 
     context_bits = []
     if mem:
-        context_bits.append("Remembered snippets:\n- " + "\n- ".join(clip_text(m, 280) for m in mem))
+        context_bits.append(
+            "Remembered snippets:\n- " + "\n- ".join(clip_text(m, 280) for m in mem)
+        )
     if products:
         context_bits.append(
-            f"User has {len(products)} extracted tender products loaded "
-            "(they can ask to fix names anytime)."
+            f"User has {len(products)} extracted tender products loaded."
         )
 
     user_block = state.get("instruction") or ""
-    lang_hint = (
-        "Reply language: match the user's latest message exactly "
-        "(English→English, Hindi→Hindi, Hinglish→Hinglish). Do not mix."
-    )
     if context_bits:
-        user_block = (
-            "\n\n".join(context_bits)
-            + "\n\n"
-            + lang_hint
-            + "\n\nUser: "
-            + user_block
-        )
+        user_block = "\n\n".join(context_bits) + "\n\nUser: " + user_block
     else:
-        user_block = lang_hint + "\n\nUser: " + user_block
+        user_block = "User: " + user_block
 
-    messages = [{"role": "system", "content": _CHAT_SYSTEM}]
+    messages = [{"role": "system", "content": _with_instructions(_CHAT_BASE)}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_block})
 
     try:
         raw, provider = _call_llm(settings, messages, json_mode=False, temperature=0.55)
-        return {**state, "reply": raw.strip(), "changes": [], "summary": "", "provider": provider}
+        return {
+            **state,
+            "reply": raw.strip(),
+            "changes": [],
+            "summary": "",
+            "provider": provider,
+        }
     except Exception as exc:  # noqa: BLE001
         return {**state, "error": str(exc), "reply": "", "provider": "mistral"}
 
@@ -283,15 +290,21 @@ def node_tender_fix(state: AgentState) -> AgentState:
     history = compact_history(state.get("history") or [], max_messages=6, max_chars_each=400)
     products = state.get("products") or []
     mem = state.get("memory") or []
+    instruction = state.get("instruction") or ""
 
     prompt = (
         f"Rows:\n{json.dumps(products, ensure_ascii=False)}\n\n"
-        f"User: {state.get('instruction') or ''}"
+        f"User: {instruction}"
     )
     if mem:
-        prompt = "Past corrections/memory:\n- " + "\n- ".join(clip_text(m, 200) for m in mem[:3]) + "\n\n" + prompt
+        prompt = (
+            "Past memory:\n- "
+            + "\n- ".join(clip_text(m, 200) for m in mem[:3])
+            + "\n\n"
+            + prompt
+        )
 
-    messages = [{"role": "system", "content": _FIX_SYSTEM}]
+    messages = [{"role": "system", "content": _with_instructions(_FIX_BASE)}]
     messages.extend(history)
     messages.append({"role": "user", "content": prompt})
 
@@ -343,6 +356,7 @@ def apply_product_changes(
     products: list[ProductItem],
     changes: list,
 ) -> tuple[int, int]:
+    """Apply AI-proposed changes; names come from the model (instruction-driven)."""
     learning = get_name_learning()
     updated = removed = 0
     remove_indices: set[int] = set()
@@ -355,19 +369,15 @@ def apply_product_changes(
         if ch.get("remove"):
             desc = products[idx].description or ""
             if desc:
-                learning.learn_reject(
-                    desc,
-                    reason="work" if is_work_description(desc) else "rejected",
-                )
+                learning.learn_reject(desc, reason="rejected")
             remove_indices.add(idx)
             continue
         new_name = str(ch.get("product_name") or "").strip()
         desc = products[idx].description or ""
-        checked = recheck_product_name(desc, new_name, extra_verbs=learning.extra_verbs)
-        if not checked or not _validate_name(desc, checked):
+        if not _validate_name(desc, new_name):
             continue
-        products[idx].product_name = checked
-        learning.learn(desc, checked)
+        products[idx].product_name = new_name
+        learning.learn(desc, new_name)
         updated += 1
     if remove_indices:
         products[:] = [p for i, p in enumerate(products) if i not in remove_indices]

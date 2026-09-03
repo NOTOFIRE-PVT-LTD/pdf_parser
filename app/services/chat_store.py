@@ -17,6 +17,21 @@ def _chat_path(cache_dir: Path) -> Path:
     return cache_dir / "chat_history.json"
 
 
+def _slim_message(msg: Any) -> dict[str, Any]:
+    """Drop heavy / session-only fields so history JSON stays small & durable."""
+    if not isinstance(msg, dict):
+        return {}
+    out = {
+        k: v
+        for k, v in msg.items()
+        if k
+        not in {
+            "checkpoint_results",  # huge BOQ dumps — must not wipe the store
+        }
+    }
+    return out
+
+
 def _serialize_chat(chat: dict) -> dict[str, Any]:
     results = []
     for r in chat.get("results") or []:
@@ -28,7 +43,7 @@ def _serialize_chat(chat: dict) -> dict[str, Any]:
         "id": chat["id"],
         "title": chat.get("title") or "New chat",
         "created": chat.get("created") or "",
-        "messages": list(chat.get("messages") or []),
+        "messages": [_slim_message(m) for m in (chat.get("messages") or [])],
         "results": results,
     }
 
@@ -40,11 +55,15 @@ def _deserialize_chat(raw: dict) -> dict:
             results.append(TenderResult.model_validate(item))
         except Exception as exc:  # noqa: BLE001
             logger.debug("Skip bad tender result in chat store: %s", exc)
+    messages = []
+    for m in raw.get("messages") or []:
+        if isinstance(m, dict):
+            messages.append(_slim_message(m))
     return {
         "id": str(raw.get("id") or ""),
         "title": str(raw.get("title") or "New chat"),
         "created": str(raw.get("created") or ""),
-        "messages": list(raw.get("messages") or []),
+        "messages": messages,
         "results": results,
     }
 

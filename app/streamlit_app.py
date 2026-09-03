@@ -454,18 +454,33 @@ def _friendly_ai_error(summary: str, error: str | None) -> str:
             "Rate limit exceeded. Wait a minute, or put a fresh "
             "`MISTRAL_API_KEY` in `.env` and refresh."
         )
+    if "timed out" in blob or "timeout" in blob:
+        return (
+            "AI timed out on a batch. Large lists are still fixed in one message "
+            "(automatic small batches) — send the same instruction again to retry."
+        )
     if "no_key" in (error or "") or "api_key" in blob or "set mistral" in blob:
         return "AI key missing. Add `MISTRAL_API_KEY` in `.env`, then refresh."
     return summary or "Something went wrong. Try again."
 
 
 def _history_chats() -> list[dict]:
+    """Sidebar list — keep titled chats even while empty (e.g. mid-edit)."""
     chats = sorted(
         st.session_state.chats.values(),
         key=lambda c: c.get("created", ""),
         reverse=True,
     )
-    return [c for c in chats if c.get("messages")]
+    out: list[dict] = []
+    for c in chats:
+        msgs = c.get("messages") or []
+        title = (c.get("title") or "").strip() or "New chat"
+        if msgs:
+            out.append(c)
+        elif title != "New chat":
+            # Edit can temporarily clear messages — do not hide the chat
+            out.append(c)
+    return out
 
 
 def _md_to_html(text: str) -> str:
@@ -495,8 +510,14 @@ def _thinking_html(label: str) -> str:
 
 
 def _start_new_chat() -> None:
+    # Only reuse a virgin blank slot — never steal a titled chat emptied by Edit
     empty = next(
-        (c for c in st.session_state.chats.values() if not c.get("messages")),
+        (
+            c
+            for c in st.session_state.chats.values()
+            if not c.get("messages")
+            and ((c.get("title") or "").strip() or "New chat") == "New chat"
+        ),
         None,
     )
     if empty:
@@ -715,30 +736,18 @@ def _refresh_assistant(chat: dict, idx: int) -> None:
 
 
 def _render_hover_actions(chat: dict, idx: int, role: str, content: str) -> None:
-    """Icon toolbar — CSS hides until the message row is hovered."""
-    cid = chat["id"]
-    if role == "user":
-        sp, a1, a2 = st.columns([14, 1, 1], gap="small")
-        with a1:
-            _html('<span class="nf-action-hit nf-action-hit-user"></span>')
-            if st.button("✏️", key=f"edit_{cid}_{idx}", help="Edit"):
-                _start_edit_user(chat, idx)
-        with a2:
-            if st.button("📋", key=f"copy_u_{cid}_{idx}", help="Copy"):
-                _copy_to_clipboard(content)
+    """Small muted Edit/Copy — user messages only, visible on hover."""
+    if role != "user":
         return
-
-    a1, a2, a3, sp = st.columns([1, 1, 1, 14], gap="small")
-    with a1:
-        _html('<span class="nf-action-hit nf-action-hit-ai"></span>')
-        if st.button("🔄", key=f"ref_{cid}_{idx}", help="Refresh / regenerate"):
-            _refresh_assistant(chat, idx)
-    with a2:
-        if st.button("📋", key=f"copy_a_{cid}_{idx}", help="Copy"):
+    cid = chat["id"]
+    spacer, edit_col, copy_col = st.columns([12, 1, 1], gap="small")
+    with edit_col:
+        _html('<span class="nf-action-hit"></span>')
+        if st.button("Edit", key=f"edit_{cid}_{idx}", help="Edit message"):
+            _start_edit_user(chat, idx)
+    with copy_col:
+        if st.button("Copy", key=f"copy_u_{cid}_{idx}", help="Copy message"):
             _copy_to_clipboard(content)
-    with a3:
-        if st.button("↩", key=f"rev_{cid}_{idx}", help="Revert to before this reply"):
-            _revert_assistant(chat, idx)
 
 
 def _render_user_bubble(content: str, files: list[str] | None = None) -> None:
@@ -843,6 +852,8 @@ def _build_pdf_reply(chat: dict, results: list[TenderResult]) -> dict:
             "content": "I couldn’t extract products from the upload.\n\n" + "\n".join(err_lines),
         }
 
+    # Do NOT call AI on the full list here — 500+ rows time out.
+    # User can ask to clean/fix; chat_ai processes in chunks.
     total = sum(len(r.products) for r in ok)
     lines = [
         f"Extracted **{total} products** from **{len(ok)}** file(s).",
@@ -854,7 +865,9 @@ def _build_pdf_reply(chat: dict, results: list[TenderResult]) -> dict:
         lines.append("")
         lines.append(f"{len(failed)} file(s) had issues and were skipped.")
     lines.append("")
-    lines.append("Tell me what to fix, or download Excel below.")
+    lines.append(
+        "Tell me what to fix (e.g. clean names, remove work rows), or download Excel below."
+    )
     return {
         "role": "assistant",
         "content": "\n".join(lines),
@@ -879,14 +892,31 @@ def _build_text_reply(chat: dict, text: str, status) -> dict:
     history = history[-16:]
 
     status.html(_thinking_html("Thinking…"))
-    status.html(_thinking_html("Generating response…"))
-    result = chat_ai(
-        text,
-        products=products,
-        history=history,
-        settings=settings,
-        chat_id=str(chat.get("id") or "global"),
-    )
+
+    def _progress(done: int, total: int, batch: int) -> None:
+        if total <= 35:
+            status.html(_thinking_html("Generating response…"))
+            return
+        status.html(
+            _thinking_html(
+                f"Fixing products… {min(done, total)}/{total} "
+                f"(batch {batch}) — one message, full list"
+            )
+        )
+
+    # Streamlit sometimes keeps a stale ai_correction in memory; only pass
+    # on_progress when the loaded function accepts it.
+    import inspect
+
+    call_kwargs: dict = {
+        "products": products,
+        "history": history,
+        "settings": settings,
+        "chat_id": str(chat.get("id") or "global"),
+    }
+    if "on_progress" in inspect.signature(chat_ai).parameters:
+        call_kwargs["on_progress"] = _progress
+    result = chat_ai(text, **call_kwargs)
 
     if result.error and not result.updated and not result.removed and not result.reply:
         return {
@@ -895,15 +925,10 @@ def _build_text_reply(chat: dict, text: str, status) -> dict:
         }
 
     bits = [result.reply or result.summary]
-    if result.updated or result.removed:
-        bits.append("")
-        bits.append(
-            f"_Applied: {result.updated} updated, {result.removed} removed · "
-            "saved to learning memory._"
-        )
+    # Learning / apply counts stay in backend — do not show in chat
     return {
         "role": "assistant",
-        "content": "\n".join(bits),
+        "content": "\n".join(b for b in bits if b).strip(),
         "show_table": bool(result.updated or result.removed),
         "excel": bool(products),
     }

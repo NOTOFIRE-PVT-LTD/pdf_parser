@@ -99,6 +99,36 @@ _NAME_TAIL_SPLIT = re.compile(
     r"spec(?:ification)?\.?\s*(?:no\.?)?\s*[A-Z0-9/])"
 )
 
+# Cut BOQ fluff after the real product noun phrase
+_BOQ_FLUFF_CUT = re.compile(
+    r"(?i)\s*(?:"
+    r"and\s+all\s+other\s+accessories|"
+    r"along\s+with\s+(?:its\s+)?(?:base|back[- ]?box|power)|"
+    r"with\s+all\s+(?:required\s+)?(?:fittings\s+and\s+)?accessories|"
+    r"as\s+per\s+(?:RDSO|IRS|IS|SEM|Drg)|"
+    r"inspection\s*:|"
+    r"inspection\s+charges\s*:|"
+    r"payment\s+terms?\s*:|"
+    r"make\s*[-:]|"
+    r"or\s+similar|"
+    r"for\s+testing\s+of|"
+    r"of\s+medium\s+size\b|"
+    r"the\s+weight\s+of\s+the\s+agent\b|"
+    r"this\s+work\s+involves\b|"
+    r"this\s+includes\b|"
+    r"complete\s+with\s+all\b|"
+    r"including\s+all\s+(?:the\s+)?accessories\b|"
+    r"with\s+auto\s+dialer\b|"
+    r"expandable\s+up\s*to\b|"
+    r"\[\[PAGE:"
+    r").*"
+)
+
+# "GSM module for Control panel with backbox" → drop trailing backbox (for-phrase already qualifies)
+_DROP_BACKBOX_AFTER_FOR = re.compile(
+    r"(?i)(\s+for\s+.+?)\s+with\s+back[- ]?box(?:es)?\s*$"
+)
+
 
 def normalize_product_description(desc: str | None) -> str | None:
     if not desc:
@@ -178,8 +208,13 @@ def _finish_name(text: str) -> str | None:
     text = _TRAILING_QTY.sub("", text).strip()
     text = _TRAILING_FOR_PERIOD.sub("", text).strip()
 
+    # Prefer BOQ fluff cut (keeps "with backbox", drops "and all other accessories…")
+    fluff = _BOQ_FLUFF_CUT.search(text)
+    if fluff and fluff.start() >= 8:
+        text = text[: fluff.start()].strip().rstrip(".,;")
+
     cut = _NAME_TAIL_SPLIT.search(text)
-    if cut:
+    if cut and cut.start() >= 8:
         text = text[: cut.start()].strip().rstrip(".,;")
 
     if ". " in text:
@@ -187,7 +222,22 @@ def _finish_name(text: str) -> str | None:
         if len(first) >= 8 and (rest.lower().startswith("inspection") or len(rest) > 80):
             text = first.strip()
 
+    # Soft trim very long names at a natural break
+    if len(text) > _MAX_NAME_CHARS:
+        for sep in (", with ", " with ", " including ", " complete "):
+            idx = text.lower().find(sep, 20)
+            if 20 <= idx <= _MAX_NAME_CHARS:
+                text = text[:idx].strip().rstrip(".,;")
+                break
+        if len(text) > _MAX_NAME_CHARS:
+            text = text[:_MAX_NAME_CHARS].rsplit(" ", 1)[0].strip().rstrip(".,;")
+
     text = text.strip(" .,;")
+    # Drop dangling open paren without close
+    if text.count("(") > text.count(")"):
+        text = text.rsplit("(", 1)[0].strip().rstrip(".,;")
+    # "… for Control panel with backbox" → keep the for-phrase, drop backbox
+    text = _DROP_BACKBOX_AFTER_FOR.sub(r"\1", text).strip().rstrip(".,;")
     return text or None
 
 
@@ -284,8 +334,6 @@ def recheck_product_name(
     Second-pass validation: strip leftover scope, reject clauses, prevent full-description bleed.
     """
     full = normalize_product_description(desc) or ""
-    if is_work_description(full):
-        return None
     if not name and full:
         return extract_product_name(full, extra_verbs=extra_verbs)
 
@@ -441,7 +489,7 @@ class ProductNameLearning:
         return True
 
     def resolve(self, desc: str | None) -> str | None:
-        if self.is_rejected(desc) or is_work_description(desc):
+        if self.is_rejected(desc):
             return None
         return extract_product_name(
             desc,

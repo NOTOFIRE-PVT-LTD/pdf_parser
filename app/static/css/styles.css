@@ -481,7 +481,7 @@ div[data-testid="stChatInput"] {
   margin: 0 auto;
 }
 
-/* —— Message hover actions (Edit / Copy / Refresh / Revert) —— */
+/* —— User message hover: small muted Edit / Copy only —— */
 .nf-action-hit {
   display: block;
   height: 0;
@@ -497,40 +497,44 @@ div[data-testid="stChatInput"] {
   margin: 0.35rem 0 0.6rem;
 }
 
-/* Hidden until hover on bubble above or the action row itself */
 .main [data-testid="stHorizontalBlock"]:has(.nf-action-hit) {
-  margin-top: -0.2rem !important;
-  margin-bottom: 0.5rem !important;
-  min-height: 2rem;
+  margin-top: -0.35rem !important;
+  margin-bottom: 0.35rem !important;
+  min-height: 1.5rem;
   opacity: 0;
-  transition: opacity 120ms ease;
+  transition: opacity 100ms ease;
+  justify-content: flex-end !important;
 }
 
 .main [data-testid="stHorizontalBlock"]:has(.nf-action-hit):hover,
 .main [data-testid="stHorizontalBlock"]:has(.nf-action-hit):focus-within,
-.main [data-testid="stElementContainer"]:has(.nf-row):hover
+.main [data-testid="stElementContainer"]:has(.nf-row-user):hover
   + [data-testid="stElementContainer"]
   [data-testid="stHorizontalBlock"]:has(.nf-action-hit) {
   opacity: 1 !important;
 }
 
 .main [data-testid="stHorizontalBlock"]:has(.nf-action-hit) .stButton > button {
-  min-height: 1.9rem !important;
-  min-width: 1.9rem !important;
-  max-width: 2.1rem !important;
-  padding: 0 !important;
+  min-height: 1.35rem !important;
+  min-width: auto !important;
+  height: auto !important;
+  padding: 0.1rem 0.4rem !important;
   justify-content: center !important;
-  border-radius: 8px !important;
-  background: var(--nf-input) !important;
-  border: 1px solid var(--nf-border) !important;
-  color: var(--nf-text) !important;
+  border-radius: 4px !important;
+  background: transparent !important;
+  border: none !important;
   box-shadow: none !important;
-  font-size: 0.9rem !important;
+  color: var(--nf-muted) !important;
+  font-size: 0.72rem !important;
+  font-weight: 500 !important;
+  letter-spacing: 0.01em;
 }
 
 .main [data-testid="stHorizontalBlock"]:has(.nf-action-hit) .stButton > button:hover {
-  background: var(--nf-hover) !important;
-  border-color: var(--nf-accent) !important;
+  background: transparent !important;
+  color: var(--nf-text) !important;
+  border: none !important;
+  text-decoration: underline;
 }
 
 @media (max-width: 768px) {
