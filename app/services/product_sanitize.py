@@ -11,6 +11,7 @@ from app.services.name_learning import get_name_learning
 from app.utils.product_name import (
     extract_product_name,
     is_clause_or_junk,
+    is_work_description,
     normalize_product_description,
     recheck_product_name,
 )
@@ -79,9 +80,12 @@ def sanitize_products(raw_products: list[Any]) -> list[ProductItem]:
         if not _is_valid_row(data, desc):
             continue
 
+        learning = get_name_learning()
+        if desc and (is_work_description(desc) or learning.is_rejected(desc)):
+            continue
+
         data["s_no"] = sno or None
         data["description"] = desc
-        learning = get_name_learning()
         name = learning.resolve(desc) if desc else None
         if not name and desc:
             name = extract_product_name(desc)

@@ -5,7 +5,12 @@ from __future__ import annotations
 from app.models.schemas import ProductItem, TenderInformation, TenderResult
 from app.services.export_service import ExportService
 from app.services.product_sanitize import sanitize_products
-from app.utils.product_name import extract_product_name, normalize_product_description, recheck_product_name
+from app.utils.product_name import (
+    extract_product_name,
+    is_work_description,
+    normalize_product_description,
+    recheck_product_name,
+)
 
 
 def test_supply_of_stripped_from_name_not_description():
@@ -166,3 +171,33 @@ def test_excel_export_name_vs_description_columns():
     assert "Supply of" in (row["itemDescription"] or "")
     assert "Inspection: RDSO" in (row["itemDescription"] or "")
     assert row["productName"] != row["itemDescription"]
+
+
+def test_civil_work_paragraphs_are_not_products():
+    work = (
+        "RE-INSTATEMENT OF PLATFORM AND REPAIRING TO ORIGINAL STATE AFTER CABLE LAYING, "
+        "EXCAVATION OF TRENCH IN ALL KIND OF SOIL AND REFILLING OF TRENCH AND "
+        "REINSTATEMENT OF TRACK WHILE TRACK CROSSING."
+    )
+    trench = (
+        "Excavation of cable trench as per cable route plan, 1.2 Mtr. deep and of "
+        "0.3 Mtr. to 0.6 Mtr. wide at bottom without brick alongside the track in "
+        "all kinds of soil, conforming to distances as per cable route plan and "
+        "refilling. This work includes clearing of route from bushes etc."
+    )
+    assert is_work_description(work)
+    assert is_work_description(trench)
+    assert not is_work_description("Supply of 6 Quad Jelly Filled Cable 0.9mm")
+
+    items = sanitize_products([
+        ProductItem(s_no="1", description=work, item_qty="10", unit_rate="100", amount="1000"),
+        ProductItem(
+            s_no="2",
+            description="Supply of Disconnect Terminal Block",
+            item_qty="5",
+            unit_rate="50",
+            amount="250",
+        ),
+    ])
+    assert len(items) == 1
+    assert items[0].product_name == "Disconnect Terminal Block"

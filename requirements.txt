@@ -24,3 +24,9 @@ python-dotenv>=1.0.0
 # Utilities
 python-dateutil>=2.9.0
 regex>=2023.12.25
+
+# AI agent — LangChain / LangGraph + vector memory (Chroma)
+langchain>=0.3.0
+langchain-core>=0.3.0
+langgraph>=0.2.0
+chromadb>=0.5.0

@@ -37,7 +37,10 @@ def apply_windows_asyncio_fix() -> None:
             self._sock = None
             server = self._server
             if server is not None:
-                server._detach()
+                try:
+                    server._detach(self)
+                except TypeError:
+                    server._detach()
                 self._server = None
             self._called_connection_lost = True
 

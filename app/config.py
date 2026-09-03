@@ -58,7 +58,11 @@ class Settings(BaseSettings):
     max_pages: int = 500
     table_min_rows: int = 1
 
-    # AI agent — Google Gemini (UI corrections)
+    # AI agent — Mistral (preferred) or Gemini
+    ai_provider: str = "mistral"
+    mistral_api_key: str | None = None
+    mistral_model: str = "mistral-small-latest"
+    mistral_base_url: str = "https://api.mistral.ai/v1"
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-flash-lite-latest"
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
