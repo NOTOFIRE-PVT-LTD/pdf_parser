@@ -90,15 +90,77 @@ class FieldExtractor:
             if now and (not data.get("name_of_work") or len(now) > len(data["name_of_work"] or "")):
                 data["name_of_work"] = now
 
-        # Division / Zone from top header: "....DIVISION.../WESTERN RLY"
+        # Division / Zone from top header ALWAYS wins over loose keyword scrapes
         div, zone = self._extract_division_zone(text)
-        if div and not data.get("division_name"):
+        if div:
             data["division_name"] = div
-        if zone and not data.get("zone"):
+        if zone:
             data["zone"] = zone
-        # Railway only when PDF text actually names a railway / RLY
-        if not data.get("railway"):
-            data["railway"] = self._extract_railway(text, zone=data.get("zone") or zone)
+
+        # GeM Bid Details (Bid Number / BOQ Title / EMD / etc.)
+        gem = self._extract_gem_fields(text)
+        for key, value in gem.items():
+            if not value:
+                continue
+            if key == "name_of_work":
+                cur = data.get("name_of_work") or ""
+                # Replace garbage keyword grabs with BOQ Title
+                if (
+                    not cur
+                    or len(cur) < 20
+                    or cur.lower().startswith("to ")
+                    or "policy and regulatory" in cur.lower()
+                    or len(value) > len(cur)
+                ):
+                    data[key] = value
+                continue
+            if key == "advertised_value":
+                if value.isdigit() and int(value) < 1000:
+                    continue
+                data[key] = value
+                continue
+            if key in {"zone", "division_name"}:
+                cur = data.get(key) or ""
+                if (
+                    not cur
+                    or len(value) >= len(cur)
+                    or not re.search(r"(?i)ministry|state|department|uttar|ports|medical", cur)
+                ):
+                    data[key] = value
+                continue
+            if not data.get(key) or key in {"tender_no", "closing_date_time", "earnest_money"}:
+                data[key] = value
+
+        # Railway only from zone/header or explicit Railway name — never "Indian Railway website"
+        data["railway"] = self._extract_railway(text, zone=data.get("zone") or zone)
+
+        # IREPS NIT HEADER same-line labels (when block parser misses)
+        for field, lab in (
+            ("bidding_type", r"Bidding\s*type"),
+            ("tender_type", r"Tender\s*Type"),
+            ("bidding_system", r"Bidding\s*System"),
+            ("bidding_style", r"Bidding\s*Style"),
+            ("contract_type", r"Contract\s*Type"),
+            ("contract_category", r"Contract\s*Category"),
+            ("tendering_section", r"Tendering\s*Section"),
+            ("expenditure_type", r"Expenditure\s*Type"),
+            ("bid_validity_days", r"Validity\s*of\s*Offer\s*\(?\s*Days?\s*\)?"),
+            ("tender_doc_cost", r"Tender\s*Doc\.?\s*Cost\s*\(?\s*Rs\.?\s*\)?"),
+            ("bidding_start_date", r"Bidding\s*Start\s*Date"),
+            ("published_date", r"Date\s*Time\s*Of\s*Uploading\s*Tender"),
+            ("pre_bid_required", r"Pre-Bid\s*Conference\s*Required"),
+            ("jv_allowed", r"Are\s*JV\s*allowed\s*to\s*bid"),
+        ):
+            if data.get(field):
+                continue
+            m = re.search(
+                rf"(?im){lab}\s*[:\-–]?\s+(?P<val>[A-Za-z0-9][^\n]{{0,80}}?)(?=\s{{2,}}[A-Z][a-z]|\n|$)",
+                text,
+            )
+            if m:
+                val = collapse_whitespace(m.group("val"))
+                if val and not self._is_placeholder(val) and not self._looks_like_label(val):
+                    data[field] = truncate(val, 200)
 
         # Closing Date/Time — always prefer dedicated parser
         closing = self._extract_closing_datetime(text)
@@ -139,9 +201,37 @@ class FieldExtractor:
         if data.get("division_name"):
             data["division_name"] = self._clean_division(data["division_name"])
         if data.get("zone"):
-            data["zone"] = self._clean_zone(data["zone"])
+            z = data["zone"]
+            if re.search(r"(?i)\b(?:rly|railway)\b", str(z)):
+                data["zone"] = self._clean_zone(z)
+            else:
+                data["zone"] = truncate(collapse_whitespace(str(z)), 120)
         if data.get("railway"):
-            data["railway"] = self._clean_zone(data["railway"]) or data["railway"]
+            cleaned_r = self._clean_zone(data["railway"]) or data["railway"]
+            if cleaned_r and "website" not in str(cleaned_r).lower():
+                data["railway"] = cleaned_r
+            else:
+                data["railway"] = None
+
+        # GeM cleanup: drop bogus advertised/zone scrapes
+        from app.utils.portal import detect_portal
+
+        if detect_portal(text) == "gem":
+            adv = str(data.get("advertised_value") or "")
+            tq = re.search(r"(?i)Total\s*Quantity\s+(\d+)", text)
+            if tq and adv.replace(",", "") == tq.group(1):
+                data["advertised_value"] = None
+            if adv.isdigit() and int(adv) < 1000 and "." not in adv:
+                # Tiny integers are almost never GeM bid value
+                data["advertised_value"] = None
+            zone = str(data.get("zone") or "")
+            if zone and not re.search(
+                r"(?i)ministry|state|government|uttar|ports|railway|department",
+                zone,
+            ):
+                # Prefer Ministry/State from gem fields if current zone is catalogue noise
+                gem_zone = self._extract_gem_fields(text).get("zone")
+                data["zone"] = gem_zone
 
         return TenderInformation(**{k: data.get(k) for k in TenderInformation.model_fields})
 
@@ -253,46 +343,125 @@ class FieldExtractor:
         """
         Railway name from PDF only — never invent.
 
-        Prefer an explicit 'Railway' label; else use zone when it clearly
-        names a railway (… RLY / … Railway).
+        Prefer zone when it clearly names a railway (… RLY / … Railway).
+        Explicit 'Railway name' label only (not 'Indian Railway website').
         """
+        if zone and re.search(r"(?i)\b(?:rly|railway)\b", zone):
+            return zone
+
         labeled = self._find_labeled_value(
             text,
-            [r"railway\s*(?:name)?", r"name\s+of\s+(?:the\s+)?railway"],
+            [r"railway\s+name", r"name\s+of\s+(?:the\s+)?railway"],
         )
         if labeled:
             cleaned = collapse_whitespace(labeled)
-            if cleaned and "page" not in cleaned.lower():
-                return truncate(cleaned, 200)
-
-        if zone and re.search(r"(?i)\b(?:rly|railway)\b", zone):
-            return zone
+            low = (cleaned or "").lower()
+            if cleaned and "page" not in low and "website" not in low and "www." not in low:
+                if re.search(r"(?i)\b(?:rly|railway)\b", cleaned) or len(cleaned) <= 40:
+                    return truncate(cleaned, 200)
         return None
 
-    def _extract_closing_datetime(self, text: str) -> str | None:
+    def _extract_gem_fields(self, text: str) -> dict[str, str | None]:
+        """Parse GeM Bid Document header fields from English label tails."""
+        out: dict[str, str | None] = {}
+        # Strip PDF cid glyph noise for matching
+        clean = re.sub(r"\(cid:\d+\)", " ", text)
+        clean = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u0900-\u097F]+", " ", clean)
+
         m = re.search(
-            r"(?i)(?:tender\s+)?closing\s*date(?:\s*/?\s*time|\s+time)?\s*[:\-–]?\s*"
-            r"(\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
-            text,
+            r"(?i)Bid\s*Number\s*:\s*(GEM/\d+/B/\d+)",
+            clean,
         )
         if m:
-            return m.group(1).strip()
+            out["tender_no"] = m.group(1).strip()
+            out["reference_no"] = m.group(1).strip()
+
+        m = re.search(
+            r"(?i)Bid\s*End\s*Date\s*/?\s*Time\s+(\d{1,2}-\d{1,2}-\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?)",
+            clean,
+        )
+        if m:
+            out["closing_date_time"] = m.group(1).strip()
+
+        m = re.search(
+            r"(?i)Bid\s*Offer\s*Validity\s*\(From\s*End\s*Date\)\s*(\d+\s*\(?Days?\)?)",
+            clean,
+        )
+        if not m:
+            m = re.search(r"(?i)Bid\s*Offer\s*Validity[^\n]{0,40}?(\d+)\s*\(?Days?\)?", clean)
+        if m:
+            out["bid_validity_days"] = re.sub(r"[^\d]", "", m.group(1)) or m.group(1).strip()
+
+        m = re.search(r"(?i)BOQ\s*Title\s+([A-Za-z0-9][^\n]{5,200})", clean)
+        if m:
+            title = collapse_whitespace(m.group(1))
+            title = re.split(r"(?i)\b(?:MSE |Startup |Bid Details|Minimum )\b", title or "")[0]
+            out["name_of_work"] = truncate((title or "").strip(" /-"), 1000) or None
+
+        if not out.get("name_of_work"):
+            m = re.search(r"(?i)(?:Bid\s*Title|Primary\s*product\s*category)\s+([A-Za-z0-9][^\n]{5,200})", clean)
+            if m:
+                out["name_of_work"] = truncate(collapse_whitespace(m.group(1)), 500)
+
+        m = re.search(r"(?i)EMD\s*Amount\s+(\d[\d,]*)", clean)
+        if m:
+            out["earnest_money"] = m.group(1).replace(",", "")
+
+        m = re.search(r"(?i)Estimated\s*Bid\s*Value\s*[^\d]*(\d[\d,]*(?:\.\d+)?)", clean)
+        if m:
+            out["advertised_value"] = m.group(1).replace(",", "")
+
+        m = re.search(r"(?i)Ministry\s*/\s*State\s*Name\s+([A-Za-z][^\n]{2,120})", clean)
+        if m:
+            zone = truncate(collapse_whitespace(m.group(1)), 120)
+            # Stop at next label fragment; keep "Ports, Shipping And Waterways"
+            zone = re.split(r"(?i)\s*/\s*(?:Department|Organisation|Office|Contact)\b", zone or "")[0]
+            zone = re.split(r"(?i)\b(?:Department Name|Organisation Name|Office Name)\b", zone or "")[0]
+            out["zone"] = (zone or "").strip(" ,/-") or None
+
+        m = re.search(r"(?i)Department\s*Name\s+([A-Za-z][^\n]{2,120})", clean)
+        if m:
+            div = truncate(collapse_whitespace(m.group(1)), 120)
+            div = re.split(r"(?i)\b(?:Organisation|Office|Contact|Ministry)\b", div or "")[0]
+            out["division_name"] = (div or "").strip(" ,/-") or None
+
+        m = re.search(r"(?i)Type\s*of\s*Bid\s+([A-Za-z][A-Za-z0-9 /\-]{2,60})", clean)
+        if m:
+            out["tender_type"] = truncate(collapse_whitespace(m.group(1)), 80)
+
+        m = re.search(r"(?i)Dated\s*:\s*(\d{1,2}-\d{1,2}-\d{2,4})", clean)
+        if m:
+            out["published_date"] = m.group(1).strip()
+
+        return out
+
+    def _extract_closing_datetime(self, text: str) -> str | None:
+        patterns = [
+            r"(?i)(?:tender\s+)?closing\s*date(?:\s*/?\s*time|\s+time)?\s*[:\-–]?\s*"
+            r"(\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
+            r"(?i)bid\s*end\s*date(?:\s*/?\s*time)?\s*[:\-–]?\s*"
+            r"(\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
+            r"(?i)bid\s*end\s*date(?:\s*/?\s*time)?\s*[:\-–]?\s*"
+            r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                return m.group(1).strip()
         return None
 
     def _extract_tender_no(self, text: str) -> str | None:
         """
-        Extract only the tender number token.
-
-        Prefers header line:
-          Tender No: DYCSTE_Works_PSSA_02R
-        Never returns the following Closing Date / paragraph text.
+        Extract only the tender / bid number token (IREPS or GeM).
+        Never returns Closing Date / paragraph text.
         """
         patterns = [
-            # Header: Tender No: CODE   Closing Date/Time: ...
             r"(?im)(?:^|\n)\s*tender\s*no\.?\s*[:\-–]\s*([A-Za-z0-9][A-Za-z0-9_\-./]*)",
-            # Mid sentence: against Tender No CODE Closing...
             r"(?i)against\s+tender\s*no\.?\s*[:\-–]?\s*([A-Za-z0-9][A-Za-z0-9_\-./]*)",
             r"(?i)tender\s*no\.?\s*[:\-–]?\s*([A-Za-z0-9][A-Za-z0-9_\-./]*)",
+            # GeM: Bid Number: GEM/2024/B/1234567
+            r"(?im)(?:^|\n)\s*(?:gem\s*)?bid\s*(?:no\.?|number)\s*[:\-–]?\s*"
+            r"([A-Za-z0-9][A-Za-z0-9_\-./]*)",
         ]
         for pat in patterns:
             m = re.search(pat, text)
@@ -343,10 +512,16 @@ class FieldExtractor:
     @staticmethod
     def _clean_division(value: str) -> str | None:
         value = collapse_whitespace(value) or ""
-        # Keep only left side if slash-separated header leaked in
         if "/" in value and len(value) < 120:
             value = value.split("/", 1)[0].strip()
-        # Reject paragraph dumps
+        low = value.lower()
+        # Reject NIT labels wrongly captured as division
+        if re.search(
+            r"(?i)\b(?:bidding\s*type|tender\s*type|advertised|earnest|"
+            r"name\s+of\s+work|closing\s*date|website|www\.)\b",
+            low,
+        ):
+            return None
         if len(value) > 120 or value.lower().startswith("dy."):
             return truncate(value, 120)
         return value or None
@@ -400,6 +575,7 @@ class FieldExtractor:
             "earnest_money": r"earnest\s*money(?:\s*\(?\s*rs\.?\s*\)?)?",
             "period_of_completion": r"period\s+of\s+completion",
             "number_of_jv_member_allowed": r"number\s+of\s+jv\s+member(?:s)?\s+allowed",
+            "jv_allowed": r"(?:are\s+)?jv(?:s)?\s+allowed|joint\s+venture\s+allowed",
             "closing_date_time": r"tender\s*closing\s*date(?:\s*time)?|closing\s*date(?:\s*/?\s*time)?",
             "bidding_type": r"bidding\s*type",
             "tender_type": r"tender\s*type",
@@ -407,12 +583,23 @@ class FieldExtractor:
             "tender_doc_cost": r"tender\s*doc\.?\s*cost(?:\s*\(?\s*rs\.?\s*\)?)?",
             "bid_validity_days": r"validity\s+of\s+offer(?:\s*\(?\s*days?\s*\)?)?",
             "bidding_system": r"bidding\s*system",
+            "tendering_section": r"tendering\s*section|bidding\s*system",
             "pre_bid_conference": r"pre-?bid\s+conference(?:\s+required)?",
+            "pre_bid_required": r"pre-?bid\s+(?:conference\s+)?required",
+            "pre_bid_date": r"pre-?bid\s+(?:conference\s+)?date",
             "bidding_style": r"bidding\s*style",
             "contract_category": r"contract\s*category",
+            "expenditure_type": r"expenditure\s*type",
             "published_date": r"date\s*time\s*of\s*uploading\s*tender|uploading\s*tender",
+            "bidding_start_date": r"(?:document\s*)?download\s*start|bidding\s*start|bid\s*submission\s*start",
             "reference_no": r"reference\s*(?:no\.?|number)",
             "status": r"tender\s*status|status\s*of\s*tender",
+            "consortium_allowed": r"consortium\s+allowed",
+            "consortium_members_allowed": r"number\s+of\s+consortium\s+member",
+            "ranking_order": r"ranking\s*order",
+            "signing_authority_name": r"(?:signing\s+)?authority\s*name|name\s+of\s+(?:the\s+)?authority",
+            "signing_authority_designation": r"(?:signing\s+)?authority\s*designation|designation\s+of\s+(?:the\s+)?authority",
+            "pdf_url": r"(?:tender\s+)?(?:pdf\s*)?url|document\s*url",
         }
         for field, label in pairs.items():
             hint = "amount" if field in {

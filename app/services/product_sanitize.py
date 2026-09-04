@@ -26,8 +26,10 @@ _JUNK_DESC = re.compile(
 def _clean_description(value: str | None) -> str | None:
     if not value:
         return None
-    text = re.sub(r"\s+", " ", str(value)).strip()
+    text = re.sub(r"[\r\n\t]+", " ", str(value))
+    text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"(?i)^description\s*[:\-–]\s*", "", text).strip()
+    text = re.sub(r"(?i)^item\s*(?:details?|description|title)\s*[:\-–]\s*", "", text).strip()
     return text.lstrip("-–— ").strip() or None
 
 
@@ -40,6 +42,7 @@ def _is_valid_row(data: dict[str, Any], desc: str | None) -> bool:
     has_money = bool(re.search(r"\d", rate) or re.search(r"\d", amount))
     has_desc = bool(desc and len(desc) > 3)
     has_sno = bool(sno and re.fullmatch(r"\d+", sno))
+    schedule = str(data.get("schedule") or "")
 
     if desc and (_JUNK_DESC.search(desc) or is_clause_or_junk(desc)):
         return False
@@ -49,18 +52,22 @@ def _is_valid_row(data: dict[str, Any], desc: str | None) -> bool:
     if desc and desc.lower() in {
         "item code", "item qty", "qty unit", "unit rate",
         "basic value", "amount", "bidding unit", "description",
+        "item title", "item details", "catalogue id",
     }:
         return False
-    # Rows without S.No. must look like real BOQ lines (qty + money)
-    if not has_sno and not (has_qty and has_money):
-        return False
+    # GeM Item Category rows: description + serial is enough (qty is bid-level)
+    if has_desc and has_sno and "gem" in schedule.lower():
+        return True
+    if not has_sno and not (has_qty and (has_money or has_desc)):
+        if not (has_desc and (has_qty or has_money or data.get("item_code"))):
+            return False
     if has_qty and (has_money or has_desc or data.get("item_code")):
         return True
-    return has_desc and (has_money or has_qty)
+    return has_desc and (has_money or has_qty or has_sno)
 
 
 def sanitize_products(raw_products: list[Any]) -> list[ProductItem]:
-    """Drop junk rows; merge duplicates across extraction passes."""
+    """Drop junk rows; merge duplicates. Keep rows even if name is unresolved."""
     cleaned: list[ProductItem] = []
     for p in raw_products:
         if isinstance(p, ProductItem):
@@ -85,13 +92,23 @@ def sanitize_products(raw_products: list[Any]) -> list[ProductItem]:
 
         data["s_no"] = sno or None
         data["description"] = desc
-        name = learning.resolve(desc) if desc else None
+
+        # Prefer learned / existing name; heuristic is only a soft assist.
+        # Do NOT drop the row when name cannot be derived — AI + user
+        # instructions own naming / work-vs-product decisions.
+        name = None
+        existing = str(data.get("product_name") or "").strip() or None
+        if existing and desc and not is_clause_or_junk(existing):
+            name = recheck_product_name(desc, existing, extra_verbs=learning.extra_verbs)
+        if not name and desc:
+            name = learning.resolve(desc)
         if not name and desc:
             name = extract_product_name(desc)
-        name = recheck_product_name(desc, name, extra_verbs=learning.extra_verbs)
-        if not name or is_clause_or_junk(name):
-            continue
+            name = recheck_product_name(desc, name, extra_verbs=learning.extra_verbs)
+        if name and is_clause_or_junk(name):
+            name = None
         data["product_name"] = name
+
         if data.get("escalation"):
             data["escalation"] = re.sub(
                 r"(?i)at\s*par", "AT Par", str(data["escalation"])

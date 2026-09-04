@@ -813,41 +813,21 @@ def _render_message(msg: dict, chat: dict, idx: int) -> None:
         ]
         if len(results) == 1:
             stem = Path(results[0].meta.filename if results[0].meta else "tender").stem
-            dl1, dl2 = st.columns(2)
-            with dl1:
-                st.download_button(
-                    "Download Excel",
-                    data=exporter.to_excel_bytes(results[0]),
-                    file_name=f"{stem}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dl_xlsx_{chat['id']}_{idx}",
-                )
-            with dl2:
-                st.download_button(
-                    "Download CSV",
-                    data=exporter.to_csv_bytes(results[0], which="products"),
-                    file_name=f"{stem}.csv",
-                    mime="text/csv",
-                    key=f"dl_csv_{chat['id']}_{idx}",
-                )
+            st.download_button(
+                "Download CSV",
+                data=exporter.to_csv_bytes(results[0], which="products"),
+                file_name=f"{stem}.csv",
+                mime="text/csv",
+                key=f"dl_csv_{chat['id']}_{idx}",
+            )
         elif results:
-            dl1, dl2 = st.columns(2)
-            with dl1:
-                st.download_button(
-                    "Download all Excel",
-                    data=exporter.to_combined_excel_bytes(results),
-                    file_name="tenders_export.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dl_xlsx_{chat['id']}_{idx}",
-                )
-            with dl2:
-                st.download_button(
-                    "Download all CSV",
-                    data=exporter.to_combined_csv_bytes(results),
-                    file_name="tenders_export.csv",
-                    mime="text/csv",
-                    key=f"dl_csv_{chat['id']}_{idx}",
-                )
+            st.download_button(
+                "Download CSV",
+                data=exporter.to_combined_csv_bytes(results),
+                file_name="tenders_export.csv",
+                mime="text/csv",
+                key=f"dl_csv_{chat['id']}_{idx}",
+            )
 
 
 def _build_pdf_reply(chat: dict, results: list[TenderResult]) -> dict:
@@ -885,8 +865,9 @@ def _build_pdf_reply(chat: dict, results: list[TenderResult]) -> dict:
         lines.append(f"{len(failed)} file(s) had issues and were skipped.")
     lines.append("")
     lines.append(
-        "Tell me what to fix (e.g. clean names, remove work rows), "
-        "or download Excel / CSV below (same full portal columns)."
+        "AI reads each PDF layout (and your saved rules). "
+        "Tell me what to fix — naming / remove work rows — and I’ll remember for next PDFs. "
+        "Download CSV below (portal columns)."
     )
     return {
         "role": "assistant",

@@ -60,6 +60,8 @@ class Settings(BaseSettings):
 
     # AI agent — Mistral (preferred) or Gemini
     ai_provider: str = "mistral"
+    ai_enabled: bool = True  # master switch (AI_ENABLED)
+    ai_extract_enabled: bool = True  # AI analyzes each PDF layout
     mistral_api_key: str | None = None
     mistral_model: str = "mistral-small-latest"
     mistral_base_url: str = "https://api.mistral.ai/v1"

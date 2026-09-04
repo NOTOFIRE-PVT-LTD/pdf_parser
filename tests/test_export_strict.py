@@ -1,6 +1,9 @@
-"""Ensure Excel/CSV export never invents data."""
+"""Ensure Excel/CSV export never invents data + exact template columns."""
 
 from __future__ import annotations
+
+import csv
+import io
 
 from app.models.schemas import ProductItem, TenderInformation, TenderResult
 from app.services.export_service import ExportService, FLAT_EXCEL_COLUMNS
@@ -29,14 +32,16 @@ def test_export_leaves_missing_fields_null_not_guessed():
 
     assert row["status"] is None
     assert row["referenceNo"] is None
-    # Zone without RLY/Railway must NOT be copied into railway
     assert row["railway"] is None
     assert row["zone"] == "WESTERN"
-    assert row["allowJointVenture"] == "3"
+    assert row["jvMembersAllowed"] == "3"
+    assert row["jvAllowed"] == "Yes"
     assert row["advertisedValue"] is None
     assert row["productName"] == "Widget A"
     assert row["itemDescription"] == "Supply of Widget A"
-    assert row["itemName"] == "Widget A"
+    assert row["itemSerialNo"] == "1"
+    assert row["itemUnitRate"] == "100.00"
+    assert row["itemAmount"] == "1000.00"
     assert row["biddingUnit"] is None
 
 
@@ -58,16 +63,16 @@ def test_railway_exported_only_when_set_from_pdf():
     )
     row = ExportService().build_flat_rows(result)[0]
     assert row["railway"] == "WESTERN RLY"
-    assert row["itemNo"] == "7"  # PDF serial preserved
+    assert row["itemSerialNo"] == "7"
 
 
-def test_csv_matches_excel_columns():
+def test_csv_header_matches_template_exactly():
     result = TenderResult(
         tender_information=TenderInformation(tender_no="X-1", name_of_work="ABC"),
         products=[
             ProductItem(
                 s_no="1",
-                description="Supply of GSM module for Control panel",
+                description="Supply of GSM module for Control panel, with accessories",
                 product_name="GSM module for Control panel",
                 item_qty="1",
                 amount="100",
@@ -78,9 +83,17 @@ def test_csv_matches_excel_columns():
     csv_bytes = exporter.to_csv_bytes(result, which="products")
     text = csv_bytes.decode("utf-8-sig")
     header = text.splitlines()[0]
-    assert header == ",".join(FLAT_EXCEL_COLUMNS)
-    assert "GSM module for Control panel" in text
-    assert len(csv_bytes) > 50
+    expected = ",".join(f'"{c}"' for c in FLAT_EXCEL_COLUMNS)
+    assert header == expected
+    assert FLAT_EXCEL_COLUMNS[11] == "periodOfCompletion"
+    assert FLAT_EXCEL_COLUMNS[12] == "validityDays"
+    assert FLAT_EXCEL_COLUMNS[-1] == "productName"
+    assert '"Supply of GSM module for Control panel, with accessories"' in text
+    rows = list(csv.DictReader(io.StringIO(text)))
+    assert len(rows) == 1
+    assert rows[0]["itemQty"] == "1"
+    assert rows[0]["itemAmount"] == "100"
+    assert rows[0]["productName"] == "GSM module for Control panel"
 
 
 def test_rejects_ungrounded_product_name():
@@ -96,5 +109,4 @@ def test_rejects_ungrounded_product_name():
     )
     row = ExportService().build_flat_rows(result)[0]
     assert row["productName"] is None
-    assert row["itemName"] is None
     assert row["itemDescription"] == "Supply of Fire Ball"

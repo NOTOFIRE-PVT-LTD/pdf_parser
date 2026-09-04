@@ -45,6 +45,12 @@ def test_flat_excel_rows_match_portal_columns():
     assert set(FLAT_EXCEL_COLUMNS).issubset(set(row.keys()))
     assert row["tenderNo"] == "SDSTE-LCGATE-05"
     assert row["railway"] == "EASTERN RLY"
+    assert row["validityDays"] == "120"
+    assert row["closingAt"] is None
+    assert row["itemSerialNo"] == "1"
+    assert row["itemUnitRate"] == "177112.00"
+    assert row["itemAmount"] == "885560.00"
+    assert row["itemBasicValue"] == "885560.00"
     assert row["productName"] == "Micro Processor based Remote Terminal Unit (RTU)"
     assert row["itemDescription"] == "Supply of Micro Processor based Remote Terminal Unit (RTU)"
     assert row["productName"] != row["itemDescription"]

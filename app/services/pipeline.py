@@ -97,7 +97,12 @@ class TenderPipeline:
         text = self._inject_page_markers(text, pdf_doc, ocr_used, ocr_pages)
         tables = self.table_parser.extract_tables(path)
 
-        progress("Extracting information", 0.75)
+        from app.services.ai.pdf_extract_agent import ai_available
+
+        if ai_available(self.settings):
+            progress("AI analyzing PDF…", 0.7)
+        else:
+            progress("Extracting information", 0.75)
         result = self.extractor.extract(text, tables=tables, meta=meta)
         result.status = ExtractionStatus.COMPLETED
         result.meta = meta

@@ -42,19 +42,23 @@ LABEL_VALUE = re.compile(
 
 # ---------------------------------------------------------------------------
 # Field keyword maps (first matching label wins)
-# Tuned for IREPS / Indian Railway tender documents
-# ---------------------------------------------------------------------------
+# Tuned for IREPS / Indian Railway + GeM / generic tender documents
 TENDER_INFO_KEYWORDS: dict[str, list[str]] = {
     "name_of_work": [
         r"name\s+of\s+(?:the\s+)?work",
         r"work\s+description",
         r"tender\s*(?:title|name|subject)",
         r"subject",
+        r"bid\s*title",
+        r"bid\s*description",
+        r"item\s*category",
     ],
     "tender_no": [
         r"tender\s*(?:no\.?|number|#)",
         r"tender\s+ref(?:erence)?",
         r"enquiry\s*(?:no\.?|number)",
+        r"bid\s*(?:no\.?|number|#)",
+        r"gem\s*bid\s*(?:no\.?|number)?",
     ],
     "closing_date_time": [
         r"closing\s*date\s*/?\s*time",
@@ -62,14 +66,19 @@ TENDER_INFO_KEYWORDS: dict[str, list[str]] = {
         r"bid\s*submission\s*(?:end|closing|last|due)",
         r"(?:last|due|closing)\s*date\s*(?:of\s*)?(?:bid|tender)?\s*submission",
         r"due\s*date(?:\s*/?\s*time)?",
+        r"bid\s*end\s*date(?:\s*/?\s*time)?",
+        r"bid\s*closing\s*date",
     ],
     "division_name": [
         r"division\s*name",
-        r"\bdivision\b",
+        r"ministry\s*/\s*department",
+        r"department\s*name",
+        r"organisation\s*name|organization\s*name",
     ],
     "zone": [
         r"\bzone\b",
         r"railway\s*zone",
+        r"state\s*/?\s*ut",
     ],
     "advertised_value": [
         r"advertised\s*value",
@@ -77,6 +86,8 @@ TENDER_INFO_KEYWORDS: dict[str, list[str]] = {
         r"tender\s*(?:value|cost|amount)",
         r"approx(?:imate)?\s*(?:cost|value)",
         r"project\s*cost",
+        r"total\s*(?:bid|contract)\s*value",
+        r"bid\s*to\s*(?:ra|rae)",
     ],
     "earnest_money": [
         r"earnest\s*money(?:\s*\(?\s*rs\.?\s*\)?)?",
@@ -328,19 +339,36 @@ DOCUMENT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("Experience Certificate", re.compile(r"experience\s*certificate", re.I)),
 ]
 
-# Product / schedule table header synonyms (Railway IREPS + generic BOQ)
+# Product / schedule table header synonyms (IREPS + GeM + generic BOQ)
 PRODUCT_HEADER_ALIASES: dict[str, list[str]] = {
     "s_no": [
         "sl", "s.no", "s.no.", "sno", "sn", "sr", "sr.no", "sr.no.",
         "item no", "item no.", "item#", "#", "no", "no.",
+        "sl. no", "sl no", "serial no", "serial number",
     ],
-    "item_code": ["item code", "itemcode", "code", "item id"],
-    "item_qty": ["item qty", "qty", "quantity", "qnty", "nos", "no.s", "approx qty"],
-    "qty_unit": ["qty unit", "unit", "uom", "unit of measure", "unit of measurement", "units"],
-    "unit_rate": ["unit rate", "rate", "unitrate"],
+    "item_code": [
+        "item code", "itemcode", "code", "item id",
+        "catalogue id", "catalog id", "catalogue no", "catalog no",
+        "sku", "hsn", "product id", "gem item id",
+    ],
+    "item_qty": [
+        "item qty", "qty", "quantity", "qnty", "nos", "no.s", "approx qty",
+        "ordered quantity", "required qty", "bid quantity",
+    ],
+    "qty_unit": [
+        "qty unit", "unit", "uom", "unit of measure", "unit of measurement",
+        "units", "unit name",
+    ],
+    "unit_rate": [
+        "unit rate", "rate", "unitrate", "unit price", "price per unit",
+        "offer price", "quoted price",
+    ],
     "basic_value": ["basic value", "basicvalue", "basic amt", "basic amount"],
     "escalation": ["escl", "escl.(%)", "escl(%)", "escalation", "escl %"],
-    "amount": ["amount", "amt", "total amount"],
+    "amount": [
+        "amount", "amt", "total amount", "total price", "line total",
+        "total value", "item total",
+    ],
     "bidding_unit": ["bidding unit", "bid unit"],
     "description": [
         "description",
@@ -348,10 +376,16 @@ PRODUCT_HEADER_ALIASES: dict[str, list[str]] = {
         "particular",
         "details",
         "item description",
+        "item details",
+        "item detail",
         "name of work",
         "item name",
+        "item title",
         "product",
         "product name",
+        "product title",
+        "specification",
+        "specifications",
     ],
 }
 
@@ -360,7 +394,9 @@ PRODUCT_SECTION_HINTS = re.compile(
     r"|schedule\s+of\s+(?:items?|rates?|quantit)"
     r"|list\s+of\s+(?:items?|materials?|products?|goods)"
     r"|items?\s+(?:to\s+be\s+)?(?:procured|supplied|purchased)"
-    r"|scope\s+of\s+supply|annexure\s*[-\s]*[a-z0-9]*\s*(?:items?|boq))",
+    r"|scope\s+of\s+supply|annexure\s*[-\s]*[a-z0-9]*\s*(?:items?|boq)"
+    r"|catalogue\s*(?:items?|details?)|item\s*details?|product\s*details?"
+    r"|consignee\s*detail|bid\s*details)",
     re.IGNORECASE,
 )
 

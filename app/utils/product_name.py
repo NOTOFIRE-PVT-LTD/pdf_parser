@@ -36,8 +36,13 @@ _SCOPE_LEAD = re.compile(
 
 _CLAUSE_JUNK = re.compile(
     r"(?i)(?:"
-    r"meaning\s+of\s+similar\s+works|similar\s+works|"
-    r"i\s*/\s*we\s+the|technical\s+bid|financial\s+bid|"
+    r"meaning\s+of\s+similar\s*works|similar\s*works|"
+    r"i\s*/\s*we\s+(?:the|hereby|understand|also)|"
+    r"technical\s+bid|financial\s+bid|"
+    r"tenderer\s+must\s+have|contractual\s+turnover|"
+    r"downloaded\s+the\s+tender|indian\s+railway\s+website|"
+    r"forged\s*/?\s*false|contents\s+of\s+the\s+certificate|"
+    r"relevant\s+annexure\s+is\s+to\s+be\s+submitted|"
     r"^\d+\.\d+\s+(?:meaning|scope|general|definition|similar)"
     r")"
 )
@@ -134,11 +139,22 @@ def normalize_product_description(desc: str | None) -> str | None:
     if not desc:
         return None
     text = desc.strip()
+    text = re.sub(r"\[\[PAGE:\d+\]\]", " ", text)
     text = _DESC_PREFIX.sub("", text).strip()
-    text = text.lstrip("-–— \"'").strip()
+    text = text.lstrip("-–— \"'/").strip()
     if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
         text = text[1:-1].strip()
     text = re.sub(r"\bo\s+f\b", "of", text, flags=re.I)
+    # Cut next BOQ amounts row accidentally glued into description
+    text = re.sub(
+        r"(?i)\s+(?:[A-Za-z]{1,6}\d{1,5}|\d{1,6})\s+"
+        r"[\d,]+\.\d{2}\s+"
+        r"(?:Numbers?|Nos?\.?|Metres?|Meters?|Mtrs?|Sets?|Each|Kgs?|Units?|"
+        r"Job|Day|Days?|Cum|Sqm|Rmt|Ton|Litre|Stations?)\s+"
+        r"[\d,]+\.\d{2}.*$",
+        "",
+        text,
+    )
     text = re.sub(r"\s+", " ", text).strip()
     return text or None
 
@@ -520,6 +536,73 @@ def extract_item_specs(desc: str | None) -> str | None:
         m = re.search(pattern, text)
         if m:
             return m.group(0).strip()
+    return None
+
+
+def extract_item_spec_number(desc: str | None) -> str | None:
+    """Spec / RDSO / IRS number only when description explicitly labels it."""
+    text = normalize_product_description(desc)
+    if not text:
+        return None
+    for pattern in (
+        r"(?i)(?:spec(?:ification)?\.?\s*(?:no\.?)?|as\s+per)\s*"
+        r"((?:RDSO|IRS|IS|IEC)[/A-Z0-9.\-]+(?:\s*ver(?:sion)?[-\s]*[\d.]+)?)",
+        r"(?i)spec(?:ification)?\.?\s*(?:no\.?)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9/\-.]{3,})",
+    ):
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def extract_item_drawing_number(desc: str | None) -> str | None:
+    text = normalize_product_description(desc)
+    if not text:
+        return None
+    m = re.search(
+        r"(?i)(?:drawing|drg\.?)\s*(?:no\.?|number)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9/\-.]+)",
+        text,
+    )
+    return m.group(1).strip() if m else None
+
+
+def extract_item_make_brand(desc: str | None) -> str | None:
+    text = normalize_product_description(desc)
+    if not text:
+        return None
+    m = re.search(
+        r"(?i)\b(?:make|brand|oem)\s*[:\-]?\s*([A-Za-z][A-Za-z0-9 &\-./]{1,40})",
+        text,
+    )
+    if not m:
+        return None
+    val = m.group(1).strip().rstrip(".,;")
+    if re.match(r"(?i)^(as|per|of|the|and|with)\b", val):
+        return None
+    return val or None
+
+
+def extract_item_inspection_agency(desc: str | None) -> str | None:
+    text = normalize_product_description(desc)
+    if not text:
+        return None
+    m = re.search(r"(?i)inspection\s*[:\-]?\s*([A-Za-z][A-Za-z0-9 &\-./]{1,40})", text)
+    if m:
+        return m.group(1).strip().rstrip(".,;")
+    return None
+
+
+def extract_item_warranty_period(desc: str | None) -> str | None:
+    """Only when description explicitly mentions warranty — never guess from duration."""
+    text = normalize_product_description(desc)
+    if not text:
+        return None
+    m = re.search(
+        r"(?i)warranty\s*(?:period)?\s*[:\-]?\s*(\d+\s*(?:months?|years?|yrs?|days?))",
+        text,
+    )
+    if m:
+        return m.group(1).strip()
     return None
 
 

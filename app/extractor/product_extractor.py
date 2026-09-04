@@ -16,6 +16,7 @@ from typing import Any
 from app.models.schemas import ProductItem
 from app.parser.table_parser import ExtractedTable, TableParser
 from app.utils.patterns import DESCRIPTION_LINE, PRODUCT_SECTION_HINTS
+from app.utils.portal import detect_portal
 from app.utils.text_utils import collapse_whitespace, truncate
 
 # Qty units seen across IREPS schedules (personnel + materials + design items)
@@ -81,6 +82,13 @@ FLEX_SCHEDULE_ROW = re.compile(
     re.IGNORECASE,
 )
 
+# Item-code + amounts on one line (next schedule row leaked into Description)
+ITEM_CODE_AMOUNTS = re.compile(
+    rf"(?i)^\s*(?P<code>{_CODE})\s+"
+    rf"(?P<qty>[\d,]+\.\d{{2}})\s+"
+    rf"(?P<unit>{_UNIT})\s+"
+    rf"(?P<rate>[\d,]+\.\d{{2}})"
+)
 # Code alone on a line (numeric or NS1)
 ITEM_CODE_ONLY = re.compile(rf"(?i)^\s*(?P<code>{_CODE})\s*$")
 # "NS1 Description:- …" or "8 Description:- …"
@@ -118,8 +126,9 @@ class ProductExtractor:
     ) -> list[ProductItem]:
         collected: list[ProductItem] = []
         current_schedule: str | None = None
+        portal = detect_portal(text)
 
-        # 1) Tables (all product-like tables, all pages)
+        # 1) Tables (all product-like tables, all pages) — works for IREPS + GeM
         if tables:
             for table in tables:
                 schedule_hint = self._schedule_from_headers_or_rows(table)
@@ -130,27 +139,115 @@ class ProductExtractor:
                         self._from_schedule_table(table, schedule=current_schedule)
                     )
 
-        # 2) IREPS plain-text schedule parser (full document — every page)
-        collected.extend(self._from_ireps_text(text))
+        # 2) Portal-specific text parsers
+        if portal == "gem":
+            collected.extend(self._from_gem_text(text))
+            # GeM PDFs rarely use IREPS amount-row + Description:- layout;
+            # only run those if tables/gem path found nothing.
+            if not collected:
+                collected.extend(self._from_ireps_text(text))
+                collected.extend(self._from_flex_regex(text))
+                collected.extend(self._from_description_anchors(text))
+        else:
+            collected.extend(self._from_ireps_text(text))
+            collected.extend(self._from_flex_regex(text))
+            collected.extend(self._from_description_anchors(text))
 
-        # 3) Whole-document flexible regex sweep (catches broken line wraps)
-        collected.extend(self._from_flex_regex(text))
-
-        # 4) Pair every Description:- with the amounts row above it
-        #    (strong for NS1 / Numbers layouts and multi-page BOQs)
-        collected.extend(self._from_description_anchors(text))
-
-        # 5) Paragraph / numbered list fallback under BOQ sections
+        # 3) Paragraph / numbered list fallback under BOQ sections
         if not collected:
             collected.extend(self._from_paragraphs(text))
 
-        # Merge duplicates, keep richest row for each identity
         products = self._merge_all(collected)
-        # Fill Description when amounts were found but the label/body
-        # was on the next line / next page / only in another extract path
         products = self._backfill_missing_descriptions(products, text)
-
         return products
+
+    def _from_gem_text(self, text: str) -> list[ProductItem]:
+        """
+        Extract GeM Bid Document catalogue lines from Item Category block.
+
+        Real GeM PDFs list products as a comma-separated Item Category list
+        (count matches Total Quantity). No invented rates/qty per line unless
+        present elsewhere.
+        """
+        items: list[ProductItem] = []
+        clean = re.sub(r"\(cid:\d+\)", " ", text)
+        clean = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u0900-\u097F]+", " ", clean)
+
+        # --- Item Category catalogue (primary GeM product list) ---
+        m = re.search(
+            r"(?is)Total\s*Quantity\s+(\d+)\s*(.*?)\s*GeMARPTS\b",
+            clean,
+        )
+        if m:
+            expected = int(m.group(1))
+            block = m.group(2)
+            # Drop section chrome
+            block = re.sub(r"(?i)\bBid\s*Details\b", " ", block)
+            block = re.sub(r"(?i)\bItem\s*Category\b", " ", block)
+            block = re.sub(r"\s+", " ", block)
+            parts = [p.strip(" /-,\t") for p in block.split(",")]
+            cats: list[str] = []
+            for p in parts:
+                p2 = re.sub(r"[\u0900-\u097F]+", " ", p)
+                p2 = re.sub(r"\[\[PAGE:\d+\]\]", " ", p2)
+                p2 = re.sub(r"\s+", " ", p2).strip(" /-")
+                # Drop leading chrome leftovers
+                p2 = re.sub(r"(?i)^(//\s*)+", "", p2).strip()
+                if len(p2) < 8:
+                    continue
+                if re.search(
+                    r"(?i)^(bid\s*details|item\s*category|total\s*quantity|"
+                    r"ministry|department|organisation|office|gemarpts)\b",
+                    p2,
+                ):
+                    continue
+                cats.append(p2)
+            # Prefer exact Total Quantity count when list is longer due to noise
+            if expected and len(cats) >= expected:
+                cats = cats[:expected]
+            for i, name in enumerate(cats, start=1):
+                items.append(
+                    ProductItem(
+                        s_no=str(i),
+                        description=truncate(name, _DESC_MAX),
+                        product_name=truncate(name, 200),
+                        schedule="GeM Item Category",
+                        source_pos=m.start(),
+                    )
+                )
+
+        # --- Labeled Item Title / Description / Qty blocks (if present) ---
+        block_re = re.compile(
+            r"(?is)(?:item\s*(?:title|name)\s*[:\-–]\s*(?P<title>.+?))?"
+            r"(?:item\s*(?:description|details?)\s*[:\-–]\s*(?P<desc>.+?))?"
+            r"(?:quantity|qty)\s*[:\-–]?\s*(?P<qty>[\d,]+\.?\d*)"
+            r"(?:\s*(?:unit|uom)\s*[:\-–]?\s*(?P<unit>[A-Za-z][A-Za-z./\-]{0,20}))?"
+            r"(?:\s*(?:unit\s*(?:rate|price)|rate|price)\s*[:\-–]?\s*"
+            r"(?:Rs\.?|INR|₹)?\s*(?P<rate>[\d,]+\.?\d*))?"
+            r"(?:\s*(?:total\s*(?:amount|price)|amount)\s*[:\-–]?\s*"
+            r"(?:Rs\.?|INR|₹)?\s*(?P<amount>[\d,]+\.?\d*))?"
+        )
+        for bm in block_re.finditer(clean):
+            title = collapse_whitespace(bm.group("title") or "") or None
+            desc = collapse_whitespace(bm.group("desc") or "") or None
+            full = collapse_whitespace(" ".join(x for x in (title, desc) if x)) or None
+            if not full and not bm.group("qty"):
+                continue
+            if full and JUNK_DESC.search(full):
+                continue
+            items.append(
+                ProductItem(
+                    item_qty=bm.group("qty"),
+                    qty_unit=collapse_whitespace(bm.group("unit") or "") or None,
+                    unit_rate=bm.group("rate"),
+                    amount=bm.group("amount"),
+                    description=truncate(full, _DESC_MAX) if full else None,
+                    product_name=truncate(title, 200) if title else None,
+                    source_pos=bm.start(),
+                )
+            )
+
+        return items
 
     # ------------------------------------------------------------------
     # Table path
@@ -671,6 +768,8 @@ class ProductExtractor:
         if IREPS_AMOUNTS_ONLY.match(line):
             return True
         if FLEX_SCHEDULE_ROW.match(line):
+            return True
+        if ITEM_CODE_AMOUNTS.match(line):
             return True
         if ITEM_CODE_WITH_DESC.match(line):
             return True
@@ -1470,9 +1569,13 @@ class ProductExtractor:
             or (item.amount and re.search(r"\d", item.amount))
         )
         has_desc = bool(desc and len(desc) > 3)
+        has_sno = bool(sno and re.fullmatch(r"\d+", sno))
+        # GeM Item Category rows: title + serial, no per-line qty in Bid PDF
+        if has_desc and has_sno and (item.schedule or "").lower().startswith("gem"):
+            return True
         if has_qty and (has_money or has_desc or item.item_code):
             return True
-        if has_desc and (has_qty or has_money or item.item_code):
+        if has_desc and (has_qty or has_money or item.item_code or has_sno):
             return True
         return False
 

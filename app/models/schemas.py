@@ -65,6 +65,19 @@ class TenderInformation(BaseModel):
     published_date: str | None = None
     reference_no: str | None = None
     status: str | None = None
+    # Extra portal CSV columns (null unless found in NIT PDF)
+    tendering_section: str | None = None
+    expenditure_type: str | None = None
+    bidding_start_date: str | None = None
+    pdf_url: str | None = None
+    pre_bid_required: str | None = None
+    pre_bid_date: str | None = None
+    jv_allowed: str | None = None
+    consortium_allowed: str | None = None
+    consortium_members_allowed: str | None = None
+    ranking_order: str | None = None
+    signing_authority_name: str | None = None
+    signing_authority_designation: str | None = None
 
 
 class FinancialInfo(BaseModel):

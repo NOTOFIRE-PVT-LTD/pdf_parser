@@ -256,6 +256,14 @@ class TableParser:
 
     @staticmethod
     def _looks_like_product_table(mapped: dict[str, int], headers: list[str]) -> bool:
+        joined = " ".join(h.lower() for h in headers)
+        # IREPS eligibility / declaration tables look like S.No+Description but are not BOQ
+        if re.search(
+            r"(?i)confirmation\s*required|remarks\s*allowed|documents?\s*uploading|"
+            r"special\s*condition|eligibility",
+            joined,
+        ):
+            return False
         product_signals = {
             "s_no",
             "item_code",
@@ -267,8 +275,10 @@ class TableParser:
             "amount",
         }
         if len(product_signals.intersection(mapped.keys())) >= 2:
-            return True
-        joined = " ".join(h.lower() for h in headers)
+            # Require qty/rate/amount OR item_code — description+sno alone is often legal text
+            if mapped.keys() & {"item_qty", "qty_unit", "unit_rate", "amount", "item_code", "basic_value"}:
+                return True
+            return False
         keywords = (
             "qty",
             "quantity",
@@ -285,7 +295,9 @@ class TableParser:
             "escl",
         )
         hits = sum(1 for k in keywords if k in joined)
-        return hits >= 2
+        return hits >= 3 and bool(
+            re.search(r"(?i)\b(?:qty|quantity|rate|amount|unit\s*rate|item\s*code)\b", joined)
+        )
 
     def merge_multipage_tables(self, tables: list[ExtractedTable]) -> list[ExtractedTable]:
         """
