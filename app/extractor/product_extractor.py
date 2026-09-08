@@ -17,7 +17,14 @@ from app.models.schemas import ProductItem
 from app.parser.table_parser import ExtractedTable, TableParser
 from app.utils.patterns import DESCRIPTION_LINE, PRODUCT_SECTION_HINTS
 from app.utils.portal import detect_portal
-from app.utils.text_utils import collapse_whitespace, truncate
+from app.utils.text_utils import (
+    clean_item_description,
+    clean_schedule_title,
+    collapse_whitespace,
+    is_list_serial,
+    strip_description_chrome,
+    truncate,
+)
 
 # Qty units seen across IREPS schedules (personnel + materials + design items)
 _UNIT = (
@@ -82,12 +89,16 @@ FLEX_SCHEDULE_ROW = re.compile(
     re.IGNORECASE,
 )
 
-# Item-code + amounts on one line (next schedule row leaked into Description)
+# Item-code + amounts on one line (NS4 2000.00 Metre 1.24 … / leaked into Description)
 ITEM_CODE_AMOUNTS = re.compile(
     rf"(?i)^\s*(?P<code>{_CODE})\s+"
     rf"(?P<qty>[\d,]+\.\d{{2}})\s+"
     rf"(?P<unit>{_UNIT})\s+"
     rf"(?P<rate>[\d,]+\.\d{{2}})"
+    rf"(?:\s+(?P<basic>[\d,]+\.\d{{2}}))?"
+    rf"(?:\s+(?P<escl>AT\s*Par|[\d,]+\.?\d*\s*%?))?"
+    rf"(?:\s+(?P<amount>[\d,]+\.\d{{2}}))?"
+    rf"(?:\s+(?P<bidunit>{_BID}))?"
 )
 # Code alone on a line (numeric or NS1)
 ITEM_CODE_ONLY = re.compile(rf"(?i)^\s*(?P<code>{_CODE})\s*$")
@@ -112,6 +123,61 @@ JUNK_DESC = re.compile(
 # information a real line item does.
 POINTER_TEXT = re.compile(r"(?i)please\s+see|see\s+(?:item\s+)?break\s*up|see\s+annexure|refer\s+annexure")
 
+# Strict units for letter-code / breakup rows (do not use the greedy _UNIT fallback)
+_STRICT_UNIT = (
+    r"Months?|Numbers?|Nos?\.?|Sets?|Each|Kgs?|Kg|Mtrs?|Metres?|Meters?|"
+    r"Units?|Lumpsum|Job|Hour|Hrs?|Days?|Pair|Pairs|Lot|Lots|"
+    r"Cum|Cmt|Sqm|Rmt|Ton(?:ne)?s?|Litres?|Ltr|Packet|Pkts?|"
+    r"Stations?|Locations?|Sites?|Blocks?|Spans?|Trips?|Shifts?|"
+    r"Km|Kilometres?|Kilometers?|Rm|Running\s*Mtr|"
+    r"Per\s+Track\s+Circuit|Per\s+Conductor|Man-?Days?"
+)
+
+# Layout D: schedule letter as Item Code ("A 3.00 Numbers 15727.00 … AT Par …")
+LETTER_CODE_AMOUNTS = re.compile(
+    rf"(?i)^\s*(?P<code>[A-Z])\s+"
+    rf"(?P<qty>[\d,]+\.\d{{2}})\s+"
+    rf"(?P<unit>{_STRICT_UNIT})\s+"
+    rf"(?P<rate>[\d,]+\.\d{{2}})\s+"
+    rf"(?P<basic>[\d,]+\.\d{{2}})\s+"
+    rf"(?P<escl>AT\s*Par|[\d,]+\.?\d*\s*%?)\s+"
+    rf"(?P<amount>[\d,]+\.\d{{2}})\s*"
+    rf"(?P<bidunit>{_BID})?\s*$"
+)
+
+# Parent schedule item that points at an Item Breakup annexure
+POINTER_AMOUNTS = re.compile(
+    rf"(?i)^\s*please\s+see.{{0,120}}?\s+"
+    rf"(?P<amount>[\d,]+\.\d{{2}})\s+"
+    rf"(?P<escl>AT\s*Par|[\d,]+\.?\d*\s*%?)\s+"
+    rf"(?P<amount2>[\d,]+\.\d{{2}})\s*$"
+)
+
+ITEM_BREAKUP_HEADING = re.compile(r"(?i)^(?:\d+\.\s*)?item\s+breakup\b")
+ITEM_BREAKUP_PARENT = re.compile(r"(?i)^item\s*[-–]?\s*(?P<sno>\d{1,4})\b")
+BREAKUP_SECTION_END = re.compile(
+    r"(?i)^(?:\d+\.\s*)?(?:eligibility|standard\s+financial|standard\s+technical|"
+    r"general\s+conditions|special\s+conditions|instructions\s+to\s+bidders|"
+    r"payment\s+terms|annexure|corrigendum)\b"
+)
+
+# Annexure line: "1 1 Supply of … unitNumbers 10.00 4720.00 47200.00"
+BREAKUP_ROW = re.compile(
+    rf"(?i)^\s*(?P<sno>\d{{1,3}})\s+(?P<code>\d{{1,3}})\s+"
+    rf"(?P<desc>.+?)"
+    rf"(?P<unit>{_STRICT_UNIT})\s+"
+    rf"(?P<qty>[\d,]+\.\d{{2}})\s+"
+    rf"(?P<rate>[\d,]+\.\d{{2}})\s+"
+    rf"(?P<amount>[\d,]+\.\d{{2}})\s*$"
+)
+
+# A genuine description continuation is prose. A stray fragment of the
+# NEXT item's own amounts row looks like this instead — reject it so it
+# doesn't get glued onto the PREVIOUS item's description.
+_PRICED_ROW_FRAGMENT = re.compile(
+    r"(?i)\bAT\s*Par\b|(?:\d[\d,]*\.\d{2}\s+){2,}"
+)
+
 
 class ProductExtractor:
     """Extract every product / schedule item being procured."""
@@ -132,12 +198,19 @@ class ProductExtractor:
         if tables:
             for table in tables:
                 schedule_hint = self._schedule_from_headers_or_rows(table)
-                if schedule_hint:
-                    current_schedule = schedule_hint
+                last_in_table = self._last_schedule_title_in_table(table)
+                # Continuation pages often have no schedule caption. Inherit the
+                # *last* title from the previous table (Schedule D after A→D),
+                # not the first caption of a merged/earlier table.
+                initial_schedule = schedule_hint or current_schedule
                 if table.is_product_table or self._looks_like_schedule_table(table):
                     collected.extend(
-                        self._from_schedule_table(table, schedule=current_schedule)
+                        self._from_schedule_table(table, schedule=initial_schedule)
                     )
+                if last_in_table:
+                    current_schedule = last_in_table
+                elif schedule_hint:
+                    current_schedule = schedule_hint
 
         # 2) Portal-specific text parsers
         if portal == "gem":
@@ -152,13 +225,17 @@ class ProductExtractor:
             collected.extend(self._from_ireps_text(text))
             collected.extend(self._from_flex_regex(text))
             collected.extend(self._from_description_anchors(text))
+            collected.extend(self._from_item_breakup_text(text))
 
         # 3) Paragraph / numbered list fallback under BOQ sections
         if not collected:
             collected.extend(self._from_paragraphs(text))
 
         products = self._merge_all(collected)
+        products = self._retag_prefixed_schedules(products, text)
+        products = self._retag_breakup_items(products)
         products = self._backfill_missing_descriptions(products, text)
+        self._link_item_breakups(products)
         return products
 
     def _from_gem_text(self, text: str) -> list[ProductItem]:
@@ -260,8 +337,20 @@ class ProductExtractor:
     ) -> list[ProductItem]:
         items: list[ProductItem] = []
         mapped = table.mapped_headers or self.table_parser.map_headers(table.headers)
+        if not self.table_parser._numeric_fields_sane(mapped, table.rows):
+            # Column cells are shifted (qty sitting in rate, etc.). Skip the
+            # table path so the text parser can recover the line items.
+            return items
+
+        header_width = len(table.headers) or (
+            (max(mapped.values()) + 1) if mapped else 0
+        )
+        in_breakup = bool(schedule and self._is_breakup_schedule(schedule))
 
         for row in table.rows:
+            row = list(row)
+            if header_width and len(row) < header_width:
+                row = row + [""] * (header_width - len(row))
             if not any((c or "").strip() for c in row):
                 continue
 
@@ -269,13 +358,27 @@ class ProductExtractor:
             lower = joined.lower()
 
             if lower.startswith("schedule") and "item qty" not in lower:
-                schedule = collapse_whitespace(joined)
+                if in_breakup:
+                    continue
+                schedule = self._clean_schedule_title(joined)
+                continue
+            if ITEM_BREAKUP_HEADING.search(joined):
+                in_breakup = True
+                continue
+            parent_m = ITEM_BREAKUP_PARENT.match(joined)
+            if parent_m and (in_breakup or not re.search(r"[\d,]+\.\d{2}", joined)):
+                in_breakup = True
+                schedule = self._breakup_title(parent_m.group("sno"))
                 continue
             if re.search(r"(?i)\b(total|grand total|sub\s*-?\s*total)\b", lower):
                 if not re.match(r"^\d+\b", joined):
+                    if in_breakup:
+                        in_breakup = False
                     continue
             # Skip repeated header rows inside multipage tables
             if "item qty" in lower and "unit rate" in lower:
+                continue
+            if in_breakup and re.match(r"(?i)^s\s*no\.?\b", joined):
                 continue
 
             def cell(field: str) -> str | None:
@@ -296,15 +399,40 @@ class ProductExtractor:
             item_qty = cell("item_qty")
             item_code = cell("item_code")
 
+            desc_belongs_to_prev = False
+            cd = ITEM_CODE_WITH_DESC.match(joined)
+            if cd and items and self._code_belongs_to_item(items[-1], cd.group("code")):
+                desc_belongs_to_prev = True
+                if desc_only is None:
+                    desc_only = collapse_whitespace(cd.group("desc") or "") or ""
+            # Page break: amounts row on previous page, Description + serial here
+            if (
+                items
+                and is_list_serial(s_no)
+                and not item_qty
+                and not cell("unit_rate")
+                and not cell("amount")
+                and (desc_only or cell("description") or cd)
+                and not (items[-1].description or "").strip()
+                and (
+                    (items[-1].item_qty and re.search(r"\d", items[-1].item_qty))
+                    or (items[-1].amount and re.search(r"\d", items[-1].amount))
+                )
+            ):
+                desc_belongs_to_prev = True
+                if not items[-1].s_no:
+                    items[-1].s_no = s_no.strip()
+
             is_continuation = items and (
-                desc_only
+                desc_belongs_to_prev
+                or desc_only
                 or (
                     not (s_no and re.fullmatch(r"\d+", s_no.strip()))
                     and not item_qty
                     and (cell("description") or joined)
                 )
             )
-            if s_no and re.fullmatch(r"\d+", s_no.strip()):
+            if is_list_serial(s_no) and not desc_belongs_to_prev:
                 is_continuation = False
 
             if is_continuation:
@@ -312,23 +440,35 @@ class ProductExtractor:
                 extra = desc_only if desc_only is not None else (
                     cell("description") or joined
                 )
-                if extra is not None and not re.match(
+                # Next item's amounts row (or a wrap of it) is not description prose.
+                if extra is not None and _PRICED_ROW_FRAGMENT.search(str(extra)):
+                    is_continuation = False
+                elif extra is not None and not re.match(
                     r"(?i)^description\s*[:\-–]?\s*$", str(extra)
                 ):
                     extra = re.sub(r"(?i)^description\s*[:\-–]\s*", "", str(extra)).strip()
                     extra = extra.lstrip("-–— ").strip()
+                    extra = strip_description_chrome(extra) or ""
+                    if extra and self._is_page_chrome(extra):
+                        extra = ""
                     if extra:
                         prev.description = truncate(
-                            collapse_whitespace(
+                            clean_item_description(
                                 ((prev.description or "") + " " + extra).strip()
                             ),
-                            2000,
+                            _DESC_MAX,
                         )
-                if table.page_number not in prev.page_numbers:
-                    prev.page_numbers.append(table.page_number)
-                continue
+                    if table.page_number not in prev.page_numbers:
+                        prev.page_numbers.append(table.page_number)
+                    continue
+                else:
+                    if table.page_number not in prev.page_numbers:
+                        prev.page_numbers.append(table.page_number)
+                    continue
 
-            s_no_is_serial = bool(s_no and re.fullmatch(r"\d+", s_no.strip()))
+            s_no_is_serial = is_list_serial(s_no)
+            if not item_code and s_no and re.fullmatch(r"\d+", s_no.strip()):
+                item_code = s_no.strip()
 
             if not s_no_is_serial:
                 # Try parsing the whole joined row as a priced IREPS-style line first.
@@ -346,6 +486,7 @@ class ProductExtractor:
             if description:
                 description = re.sub(r"(?i)^description\s*[:\-–]\s*", "", description).strip()
                 description = description.lstrip("-–— ").strip()
+                description = clean_item_description(description)
 
             # Accept row if it has qty OR rate/amount OR description
             if not any([item_qty, cell("unit_rate"), cell("amount"), description, item_code]):
@@ -465,6 +606,12 @@ class ProductExtractor:
                     i += 1
                     continue
 
+                if ITEM_BREAKUP_HEADING.match(line):
+                    awaiting_description = False
+                    skip_until_schedule = True
+                    i += 1
+                    continue
+
                 if re.search(r"(?i)^(?:schedule\s+)?(?:total|grand\s+total)\b", line):
                     awaiting_description = False
                     skip_until_schedule = True
@@ -484,16 +631,22 @@ class ProductExtractor:
                         or self._is_page_chrome(line)
                         or re.fullmatch(r"\d{1,4}", line)
                         or re.match(r"(?i)^\d{1,4}\s+(?:ar|par)\s*$", line)
+                        or re.match(r"(?i)^tender\s+no\s*:", line)
                     )
                 ):
+                    if re.fullmatch(r"\d{1,4}", line) and not items[-1].s_no and is_list_serial(line):
+                        items[-1].s_no = str(int(line))
                     i += 1
                     continue
 
                 dm = DESCRIPTION_LINE.match(line)
                 if dm and items and awaiting_description:
+                    captured: list[str] = []
                     desc, j = self._read_description_block(
-                        lines, i, sno=items[-1].s_no
+                        lines, i, sno=items[-1].s_no, captured_sno=captured
                     )
+                    if captured and not items[-1].s_no:
+                        items[-1].s_no = captured[0]
                     if desc:
                         items[-1].description = truncate(desc, _DESC_MAX)
                         awaiting_description = False
@@ -514,6 +667,9 @@ class ProductExtractor:
                     and not _BID_FRAGMENT.match(line)
                 ):
                     if re.fullmatch(r"\d{1,4}", line):
+                        prev = items[-1]
+                        if not prev.s_no and is_list_serial(line):
+                            prev.s_no = str(int(line))
                         i += 1
                         continue
                     prev = items[-1]
@@ -528,6 +684,43 @@ class ProductExtractor:
                             _DESC_MAX,
                         )
                     i += 1
+                    continue
+
+                # Layout D: schedule letter as Item Code ("A 3.00 Numbers …")
+                rm_letter = LETTER_CODE_AMOUNTS.match(line)
+                if rm_letter:
+                    item = self._item_from_letter_amounts(rm_letter, schedule, None)
+                    item.source_pos = region_offset + line_offsets[i]
+                    pg = page_at(line_offsets[i])
+                    if pg:
+                        item.page_numbers = [pg]
+                    i += 1
+                    i, awaiting_description = self._attach_code_and_desc(
+                        item, lines, i, awaiting_description=True
+                    )
+                    items.append(item)
+                    continue
+
+                # Parent line that points at Item Breakup ("Please see … 235830.00 AT Par …")
+                rm_ptr = POINTER_AMOUNTS.match(line)
+                if rm_ptr:
+                    letter = self._schedule_letter(schedule)
+                    item = ProductItem(
+                        item_code=letter.upper() if letter else None,
+                        amount=rm_ptr.group("amount"),
+                        basic_value=rm_ptr.group("amount"),
+                        escalation=collapse_whitespace(rm_ptr.group("escl")),
+                        schedule=schedule,
+                    )
+                    item.source_pos = region_offset + line_offsets[i]
+                    pg = page_at(line_offsets[i])
+                    if pg:
+                        item.page_numbers = [pg]
+                    i += 1
+                    i, awaiting_description = self._attach_code_and_desc(
+                        item, lines, i, awaiting_description=True
+                    )
+                    items.append(item)
                     continue
 
                 # Layout A: amounts row WITHOUT item code on same line
@@ -607,6 +800,22 @@ class ProductExtractor:
                     items.append(item)
                     continue
 
+                # Layout C: alphanumeric code + amounts, S.No. wrapped onto
+                # the Description line ("NS4 2000.00 Metre 1.24 …" / "4 Description:-")
+                rm_c = self._match_prefixed_code_amounts(line)
+                if rm_c:
+                    item = self._item_from_code_amounts(rm_c, schedule, None)
+                    item.source_pos = region_offset + line_offsets[i]
+                    pg = page_at(line_offsets[i])
+                    if pg:
+                        item.page_numbers = [pg]
+                    i += 1
+                    i, awaiting_description = self._attach_code_and_desc(
+                        item, lines, i, awaiting_description=True
+                    )
+                    items.append(item)
+                    continue
+
                 awaiting_description = False
                 i += 1
 
@@ -620,36 +829,60 @@ class ProductExtractor:
         awaiting_description: bool,
     ) -> tuple[int, bool]:
         """Consume following Item Code / Description lines after an amounts row."""
-        i = self._skip_noise_lines(lines, i, sno=item.s_no)
+        i = self._skip_noise_lines(lines, i, sno=item.s_no, item=item)
         if i < len(lines):
             cd = ITEM_CODE_WITH_DESC.match(lines[i].strip())
             if cd:
-                item.item_code = self._normalize_item_code(cd.group("code"))
+                new_code = self._normalize_item_code(cd.group("code"))
+                # "4 Description:-" restates the serial of NS4 / letter-code
+                # item A; do not replace the real item code with the bare number.
+                if new_code and new_code.isdigit():
+                    if not item.s_no:
+                        item.s_no = str(int(new_code))
+                elif not item.item_code:
+                    item.item_code = new_code
+                elif new_code and not self._code_belongs_to_item(item, new_code):
+                    return i, awaiting_description
                 desc = collapse_whitespace(cd.group("desc")) or ""
-                item.description = truncate(desc.lstrip("-–— \"'").strip(), _DESC_MAX) or None
-                if not item.item_code and item.s_no:
-                    item.item_code = item.s_no
+                extra = desc.lstrip("-–— \"'").strip()
+                if extra:
+                    item.description = truncate(
+                        collapse_whitespace(
+                            ((item.description or "") + " " + extra).strip()
+                        ),
+                        _DESC_MAX,
+                    )
+                self._apply_default_item_code(item)
                 return i + 1, False
             cm = ITEM_CODE_ONLY.match(lines[i].strip())
             # Don't treat a repeated numeric S.No. as an item code.
             if cm and not re.fullmatch(r"\d{1,4}", cm.group("code") or ""):
                 item.item_code = self._normalize_item_code(cm.group("code"))
                 i += 1
-                i = self._skip_noise_lines(lines, i, sno=item.s_no)
-        if not item.item_code and item.s_no:
-            item.item_code = item.s_no
-        i = self._skip_noise_lines(lines, i, sno=item.s_no)
+                i = self._skip_noise_lines(lines, i, sno=item.s_no, item=item)
+        self._apply_default_item_code(item)
+        i = self._skip_noise_lines(lines, i, sno=item.s_no, item=item)
         if i < len(lines):
-            desc, j = self._read_description_block(lines, i, sno=item.s_no)
+            captured: list[str] = []
+            desc, j = self._read_description_block(
+                lines, i, sno=item.s_no, captured_sno=captured
+            )
+            if captured and not item.s_no:
+                item.s_no = captured[0]
             if desc:
                 item.description = truncate(desc, _DESC_MAX)
+                dm = DESCRIPTION_LINE.match(lines[i].strip())
+                if dm and not item.s_no:
+                    lead = re.match(r"^\s*(\d{1,4})\s+description", lines[i].strip(), re.I)
+                    if lead:
+                        item.s_no = str(int(lead.group(1)))
                 return j, False
             if DESCRIPTION_LINE.match(lines[i].strip()):
                 return j, True
         return i, awaiting_description and not bool(item.description)
 
     def _skip_noise_lines(
-        self, lines: list[str], i: int, sno: str | None = None
+        self, lines: list[str], i: int, sno: str | None = None, item: ProductItem | None = None
     ) -> int:
         """Skip blank / bid-wrap / page-header / repeated S.No. lines."""
         while i < len(lines):
@@ -667,7 +900,10 @@ class ProductExtractor:
                 i += 1
                 continue
             if re.fullmatch(r"\d{1,4}", raw):
-                # Repeated S.No. from merged cell between amounts and Description
+                # Repeated S.No. from merged cell between amounts and Description.
+                # If the priced row still has no serial, this digit IS the serial.
+                if item is not None and not item.s_no and is_list_serial(raw):
+                    item.s_no = str(int(raw))
                 i += 1
                 continue
             if self._is_page_chrome(raw):
@@ -677,7 +913,8 @@ class ProductExtractor:
         return i
 
     def _read_description_block(
-        self, lines: list[str], i: int, sno: str | None = None
+        self, lines: list[str], i: int, sno: str | None = None,
+        captured_sno: list[str] | None = None,
     ) -> tuple[str | None, int]:
         """
         Read a Description:- block starting at lines[i].
@@ -695,6 +932,8 @@ class ProductExtractor:
         parts: list[str] = []
         first = collapse_whitespace(dm.group("desc") or "") or ""
         first = first.lstrip("-–— \"'").strip()
+        if first and _PRICED_ROW_FRAGMENT.search(first):
+            return None, i
         if first:
             parts.append(first)
         j = i + 1
@@ -709,13 +948,28 @@ class ProductExtractor:
                 j += 1
                 continue
             if re.fullmatch(r"\d{1,4}", nxt):
+                if (
+                    captured_sno is not None
+                    and not sno
+                    and not captured_sno
+                    and is_list_serial(nxt)
+                ):
+                    captured_sno.append(str(int(nxt)))
                 j += 1
                 continue
-            if sno and re.match(rf"^{re.escape(str(sno))}\s+", nxt):
-                nxt = re.sub(rf"^{re.escape(str(sno))}\s+", "", nxt).strip()
-                if not nxt:
-                    j += 1
-                    continue
+            lead = re.match(r"^(\d{1,4})\s+(.*)$", nxt)
+            if lead and is_list_serial(lead.group(1)):
+                if sno and str(int(lead.group(1))) == str(int(sno)):
+                    nxt = lead.group(2).strip()
+                    if not nxt:
+                        j += 1
+                        continue
+                elif captured_sno is not None and not sno and not captured_sno:
+                    captured_sno.append(str(int(lead.group(1))))
+                    nxt = lead.group(2).strip()
+                    if not nxt:
+                        j += 1
+                        continue
             if ITEM_CODE_ONLY.match(nxt) and not re.fullmatch(r"\d{1,4}", nxt):
                 peek = j + 1
                 while peek < len(lines) and not lines[peek].strip():
@@ -741,6 +995,7 @@ class ProductExtractor:
         if not parts:
             return None, i + 1
         text = collapse_whitespace(" ".join(parts)).lstrip("-–— \"'").strip()
+        text = clean_item_description(text) or ""
         if not text or JUNK_DESC.search(text):
             return None, j
         return text, j
@@ -750,11 +1005,12 @@ class ProductExtractor:
         """Headers/footers injected between amounts row and Description."""
         return bool(
             re.match(
-                r"(?i)^(?:\[\[PAGE:\d+\]\]|page\s+\d+\s+of\s+\d+|"
-                r"tender\s+document|tender\s+no\s*:|closing\s+date|"
-                r"run\s+date\s*/?\s*time|"
-                r"[A-Z][A-Z0-9 \-/]{2,60}DIVISION|"
-                r".{0,60}/\s*(?:EASTERN|WESTERN|NORTHERN|SOUTHERN|CENTRAL)\s+RLY)\b",
+                r"(?i)^(?:\[\[PAGE:\d+\]\]|page\s+\d+\s+of\s+\d+\b|"
+                r"tender\s+document\b|tender\s+no\s*:|closing\s+date|"
+                r"run\s+date\s*/?\s*time|\bitem\s+breakup\b|"
+                r"schedule\s*schedule|"
+                r"[A-Z][A-Z0-9 \-/]{2,60}DIVISION\b|"
+                r".{0,60}/\s*(?:EASTERN|WESTERN|NORTHERN|SOUTHERN|CENTRAL)\s+RLY\b)",
                 line,
             )
         )
@@ -762,6 +1018,8 @@ class ProductExtractor:
     def _is_description_end(self, line: str) -> bool:
         """True only when the next real schedule item / section starts."""
         if DESCRIPTION_LINE.match(line):
+            return True
+        if _PRICED_ROW_FRAGMENT.search(line):
             return True
         if IREPS_ROW_NO_CODE.match(line):
             return True
@@ -771,6 +1029,10 @@ class ProductExtractor:
             return True
         if ITEM_CODE_AMOUNTS.match(line):
             return True
+        if LETTER_CODE_AMOUNTS.match(line):
+            return True
+        if POINTER_AMOUNTS.match(line):
+            return True
         if ITEM_CODE_WITH_DESC.match(line):
             return True
         if re.match(r"(?i)^schedule\b", line):
@@ -778,6 +1040,12 @@ class ProductExtractor:
         if re.search(r"(?i)^(?:schedule\s+)?(?:total|grand\s+total)\b", line):
             return True
         if re.match(r"(?i)^(?:s\.?no\.?|item\s*code|item\s*qty)\b", line):
+            return True
+        if ITEM_BREAKUP_HEADING.match(line):
+            return True
+        if re.search(r"(?i)\bitem\s+breakup\b", line):
+            return True
+        if re.match(r"(?i)^tender\s+no\s*:", line):
             return True
         return False
 
@@ -803,6 +1071,390 @@ class ProductExtractor:
         if code.isdigit():
             return str(int(code))
         return code.upper()
+
+    @staticmethod
+    def _is_schedule_letter_code(code: str | None) -> bool:
+        if not code:
+            return False
+        return bool(re.fullmatch(r"[A-Za-z]", code.strip()))
+
+    @staticmethod
+    def _breakup_title(parent_sno: str | int) -> str:
+        return f"Item {int(str(parent_sno).strip())} Breakup"
+
+    @staticmethod
+    def _is_breakup_schedule(schedule: str | None) -> bool:
+        if not schedule:
+            return False
+        if re.search(r"(?i)\bitem\s+\d+\s+breakup\b", schedule):
+            return True
+        if re.search(r"(?i)\bbreak\s*up\b", schedule) and re.search(
+            r"(?i)\bitem\s*[-–]?\s*\d+", schedule
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _breakup_parent_sno(schedule: str | None) -> str | None:
+        if not schedule:
+            return None
+        m = re.search(r"(?i)\bitem\s*[-–]?\s*(\d{1,4})\b", schedule)
+        if m:
+            return str(int(m.group(1)))
+        return None
+
+    def _apply_default_item_code(self, item: ProductItem) -> None:
+        """Fill a missing item code. Do not replace a real numeric/NS code."""
+        if self._is_breakup_schedule(item.schedule):
+            if not (item.item_code or "").strip() and item.s_no:
+                item.item_code = str(item.s_no).strip()
+            return
+        code = (self._normalize_item_code(item.item_code) or "").strip()
+        if code:
+            return
+        if item.s_no and re.fullmatch(r"\d+", str(item.s_no).strip()):
+            item.item_code = str(item.s_no).strip()
+
+    def _promote_letter_item_codes(self, items: list[ProductItem]) -> None:
+        """When a schedule uses letter codes (A/B), don't keep S.No. as itemCode."""
+        letters_by_sched: dict[str, set[str]] = {}
+        for p in items:
+            if self._is_breakup_schedule(p.schedule) or self._is_prefixed_code(p.item_code):
+                continue
+            letter = self._schedule_letter(p.schedule)
+            if not letter:
+                continue
+            if self._is_schedule_letter_code(p.item_code):
+                letters_by_sched.setdefault(letter, set()).add(
+                    (p.item_code or "").upper()
+                )
+        for p in items:
+            if self._is_breakup_schedule(p.schedule) or self._is_prefixed_code(p.item_code):
+                continue
+            letter = self._schedule_letter(p.schedule)
+            if not letter or letter.upper() not in letters_by_sched.get(letter, set()):
+                continue
+            code = (self._normalize_item_code(p.item_code) or "").strip()
+            sno = (p.s_no or "").strip()
+            if not code or (code.isdigit() and sno and str(int(code)) == str(int(sno))):
+                p.item_code = letter.upper()
+
+    def _item_from_letter_amounts(
+        self, m: re.Match[str], schedule: str | None, page: int | None
+    ) -> ProductItem:
+        code = (m.group("code") or "").upper()
+        return ProductItem(
+            item_code=code,
+            item_qty=m.group("qty"),
+            qty_unit=m.group("unit"),
+            unit_rate=m.group("rate"),
+            basic_value=m.group("basic"),
+            escalation=collapse_whitespace(m.group("escl")),
+            amount=m.group("amount"),
+            bidding_unit=m.groupdict().get("bidunit"),
+            schedule=schedule,
+            page_numbers=[page] if page else [],
+        )
+
+    def _from_item_breakup_text(self, text: str) -> list[ProductItem]:
+        """Parse IREPS 'ITEM BREAKUP' annexures as their own category."""
+        items: list[ProductItem] = []
+        lines = text.splitlines()
+        line_offsets = self._line_offsets(text)
+        page_at = self._page_lookup(text)
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if not ITEM_BREAKUP_HEADING.match(line):
+                i += 1
+                continue
+            parent = None
+            schedule = None
+            i += 1
+            while i < len(lines):
+                nxt = lines[i].strip()
+                if not nxt:
+                    i += 1
+                    continue
+                if BREAKUP_SECTION_END.match(nxt):
+                    break
+                if ITEM_BREAKUP_HEADING.match(nxt):
+                    break
+                pm = ITEM_BREAKUP_PARENT.match(nxt)
+                if pm:
+                    parent = str(int(pm.group("sno")))
+                    schedule = self._breakup_title(parent)
+                    i += 1
+                    continue
+                if re.match(r"(?i)^s\s*no\.?\b", nxt) or nxt.lower() in {"no", "item"}:
+                    i += 1
+                    continue
+                if self._is_page_chrome(nxt) or _BID_FRAGMENT.match(nxt):
+                    i += 1
+                    continue
+                rm = BREAKUP_ROW.match(nxt)
+                if rm:
+                    desc_parts = [collapse_whitespace(rm.group("desc") or "")]
+                    j = i + 1
+                    while j < len(lines):
+                        follow = lines[j].strip()
+                        if not follow:
+                            j += 1
+                            continue
+                        if (
+                            BREAKUP_ROW.match(follow)
+                            or BREAKUP_SECTION_END.match(follow)
+                            or ITEM_BREAKUP_HEADING.match(follow)
+                            or re.search(r"(?i)^total\b", follow)
+                            or self._is_page_chrome(follow)
+                        ):
+                            break
+                        desc_parts.append(follow)
+                        j += 1
+                    desc = clean_item_description(
+                        collapse_whitespace(" ".join(p for p in desc_parts if p))
+                    )
+                    item = ProductItem(
+                        s_no=str(int(rm.group("sno"))),
+                        item_code=str(int(rm.group("code"))),
+                        description=truncate(desc, _DESC_MAX) if desc else None,
+                        qty_unit=rm.group("unit"),
+                        item_qty=rm.group("qty"),
+                        unit_rate=rm.group("rate"),
+                        amount=rm.group("amount"),
+                        schedule=schedule or (self._breakup_title(parent) if parent else "Item Breakup"),
+                    )
+                    item.source_pos = line_offsets[i]
+                    pg = page_at(line_offsets[i])
+                    if pg:
+                        item.page_numbers = [pg]
+                    items.append(item)
+                    i = j
+                    continue
+                if re.search(r"(?i)^total\b", nxt):
+                    break
+                i += 1
+        return items
+
+    def _retag_breakup_items(self, items: list[ProductItem]) -> list[ProductItem]:
+        """Keep Item-N annexure rows out of the parent schedule letter group."""
+        for p in items:
+            title = p.schedule or ""
+            if re.fullmatch(r"(?i)item\s+\d+\s+breakup", title.strip()):
+                continue
+            # Concatenated annexure caption: "Schedule A-SOR … Item- 33 Earthing…"
+            parent = self._breakup_parent_sno(title)
+            if parent and re.search(r"(?i)item\s*[-–]\s*\d+", title):
+                p.schedule = self._breakup_title(parent)
+        return items
+
+    def _link_item_breakups(self, items: list[ProductItem]) -> list[ProductItem]:
+        """Attach annexure rows to their parent and complete the lump-sum parent line."""
+        from collections import defaultdict
+
+        children: dict[str, list[ProductItem]] = defaultdict(list)
+        for p in items:
+            if not self._is_breakup_schedule(p.schedule):
+                continue
+            parent = self._breakup_parent_sno(p.schedule)
+            if not parent:
+                continue
+            p.parent_s_no = parent
+            children[parent].append(p)
+
+        for p in items:
+            if self._is_breakup_schedule(p.schedule):
+                continue
+            sno = (p.s_no or "").strip()
+            if not sno or sno not in children:
+                continue
+            self._complete_breakup_parent(p, children[sno])
+        return items
+
+    def _complete_breakup_parent(
+        self, parent: ProductItem, children: list[ProductItem]
+    ) -> None:
+        """IREPS parent line is 'Please see Item Breakup' — qty/rate sit on the annexure.
+
+        The schedule still bids this as one lump-sum line, so fill qty/rate from
+        the description ('01 no. location') and the published amount so
+        Quantity × Rate = Amount, without inventing a second priced row.
+        """
+        amount = self._norm_num(parent.amount)
+        if not amount:
+            total = 0.0
+            for child in children:
+                raw = self._norm_num(child.amount)
+                if raw:
+                    try:
+                        total += float(raw)
+                    except ValueError:
+                        continue
+            if total:
+                parent.amount = f"{total:.2f}"
+                amount = self._norm_num(parent.amount)
+        if not amount:
+            return
+
+        has_qty = bool(parent.item_qty and re.search(r"\d", parent.item_qty))
+        has_rate = bool(parent.unit_rate and re.search(r"\d", parent.unit_rate))
+        if has_qty and has_rate:
+            return
+
+        if not has_qty:
+            parent.item_qty = self._qty_from_breakup_parent_desc(parent.description)
+        if not (parent.qty_unit or "").strip():
+            parent.qty_unit = self._unit_from_breakup_parent_desc(parent.description)
+        if not has_rate:
+            try:
+                qty = float(re.sub(r"[,\s]", "", parent.item_qty or "1"))
+            except ValueError:
+                qty = 1.0
+            if qty <= 0:
+                qty = 1.0
+                parent.item_qty = "1.00"
+            rate = float(amount) / qty
+            parent.unit_rate = f"{rate:.2f}"
+        if not parent.basic_value:
+            parent.basic_value = parent.amount
+        if not parent.escalation:
+            parent.escalation = "AT Par"
+
+    @staticmethod
+    def _qty_from_breakup_parent_desc(description: str | None) -> str:
+        text = description or ""
+        m = re.search(
+            r"(?i)(\d+)\s*(?:no\.?|nos\.?|numbers?)\s+(?:location|station|cabin|hut|job|set)",
+            text,
+        )
+        if m:
+            return f"{int(m.group(1)):.2f}"
+        m = re.search(r"(?i)\bat\s+(\d+)\s*(?:no\.?|nos\.?)", text)
+        if m:
+            return f"{int(m.group(1)):.2f}"
+        return "1.00"
+
+    @staticmethod
+    def _unit_from_breakup_parent_desc(description: str | None) -> str:
+        text = (description or "").lower()
+        if re.search(r"(?i)no\.?\s+location", text):
+            return "Numbers"
+        if re.search(r"\bjobs?\b", text):
+            return "Job"
+        if re.search(r"\bsets?\b", text):
+            return "Set"
+        if re.search(r"\bstations?\b", text):
+            return "Station"
+        return "Numbers"
+
+    @staticmethod
+    def _is_prefixed_code(code: str | None) -> bool:
+        if not code:
+            return False
+        return bool(re.fullmatch(r"[A-Za-z]{1,6}\d{1,5}", code.strip()))
+
+    @classmethod
+    def _serial_from_prefixed_code(cls, code: str | None) -> str | None:
+        normalized = cls._normalize_item_code(code)
+        if not normalized:
+            return None
+        m = re.fullmatch(r"[A-Za-z]+(\d+)", normalized)
+        if m:
+            return str(int(m.group(1)))
+        return None
+
+    def _code_belongs_to_item(self, item: ProductItem, code: str | None) -> bool:
+        """True when `code` is this row's item code or its restated serial."""
+        normalized = self._normalize_item_code(code)
+        if not normalized:
+            return False
+        item_code = (self._normalize_item_code(item.item_code) or "").upper()
+        sno = (item.s_no or "").strip()
+        if item_code and item_code == normalized.upper():
+            return True
+        if normalized.isdigit() and sno == str(int(normalized)):
+            return True
+        serial = self._serial_from_prefixed_code(item_code)
+        if normalized.isdigit() and serial == str(int(normalized)):
+            return True
+        return False
+
+    def _codes_conflict(self, a: ProductItem, b: ProductItem) -> bool:
+        ca = self._normalize_item_code(a.item_code)
+        cb = self._normalize_item_code(b.item_code)
+        if not ca or not cb:
+            return False
+        return ca.lower() != cb.lower()
+
+    @staticmethod
+    def _schedule_looks_like_ns(schedule: str | None) -> bool:
+        if not schedule:
+            return False
+        return bool(re.search(r"(?i)ns\s*schedule|\bns\b", schedule))
+
+    def _match_prefixed_code_amounts(self, line: str) -> re.Match[str] | None:
+        m = ITEM_CODE_AMOUNTS.match(line)
+        if not m:
+            return None
+        if not self._is_prefixed_code(m.group("code")):
+            return None
+        return m
+
+    def _item_from_code_amounts(
+        self, m: re.Match[str], schedule: str | None, page: int | None
+    ) -> ProductItem:
+        code = self._normalize_item_code(m.group("code"))
+        sno = self._serial_from_prefixed_code(code)
+        escl = m.groupdict().get("escl")
+        return ProductItem(
+            s_no=sno,
+            item_code=code,
+            item_qty=m.group("qty"),
+            qty_unit=m.group("unit"),
+            unit_rate=m.group("rate"),
+            basic_value=m.groupdict().get("basic"),
+            escalation=collapse_whitespace(escl) if escl else None,
+            amount=m.groupdict().get("amount"),
+            bidding_unit=m.groupdict().get("bidunit"),
+            schedule=schedule,
+            page_numbers=[page] if page else [],
+        )
+
+    def _retag_prefixed_schedules(
+        self, items: list[ProductItem], text: str = ""
+    ) -> list[ProductItem]:
+        """
+        NS1/NS2/… belong to the NS SCHEDULE (typically Schedule D), even when a
+        multipage table continuation still carried Schedule A's caption.
+        """
+        titles: list[str] = []
+        for p in items:
+            if p.schedule:
+                titles.append(p.schedule)
+        if text:
+            for _off, chunk in self._schedule_chunks(text):
+                hm = re.match(r"(?im)^(schedule\b(?!\s*total)[^\n]*)", chunk)
+                if hm:
+                    titles.append(self._clean_schedule_title(hm.group(1)))
+
+        ns_title = None
+        for t in titles:
+            cleaned = self._clean_schedule_title(t)
+            if re.search(r"(?i)ns\s*schedule", cleaned) or (
+                re.search(r"(?i)\bns\b", cleaned) and self._schedule_letter(cleaned)
+            ):
+                ns_title = cleaned
+                break
+        if not ns_title:
+            return items
+
+        for p in items:
+            code = self._normalize_item_code(p.item_code) or ""
+            if re.match(r"^NS\d+$", code, re.I) and not self._schedule_looks_like_ns(
+                p.schedule
+            ):
+                p.schedule = ns_title
+        return items
 
     def _from_flex_regex(self, text: str) -> list[ProductItem]:
         """Sweep full document / schedule regions for numeric rows + descriptions."""
@@ -844,6 +1496,10 @@ class ProductExtractor:
                     skip = False
                     i += 1
                     continue
+                if line and ITEM_BREAKUP_HEADING.match(line):
+                    skip = True
+                    i += 1
+                    continue
                 if line and re.search(r"(?i)^(?:schedule\s+)?(?:total|grand\s+total)\b", line):
                     skip = True
                     i += 1
@@ -866,6 +1522,30 @@ class ProductExtractor:
                 rm_b = FLEX_SCHEDULE_ROW.match(line) if line else None
                 if rm_b:
                     item = self._item_from_flex(rm_b, local_schedule, None)
+                    item.source_pos = region_offset + line_offsets[i]
+                    pg = page_at(line_offsets[i])
+                    if pg:
+                        item.page_numbers = [pg]
+                    i, _ = self._attach_code_and_desc(
+                        item, lines, i + 1, awaiting_description=True
+                    )
+                    items.append(item)
+                    continue
+                rm_letter = LETTER_CODE_AMOUNTS.match(line) if line else None
+                if rm_letter:
+                    item = self._item_from_letter_amounts(rm_letter, local_schedule, None)
+                    item.source_pos = region_offset + line_offsets[i]
+                    pg = page_at(line_offsets[i])
+                    if pg:
+                        item.page_numbers = [pg]
+                    i, _ = self._attach_code_and_desc(
+                        item, lines, i + 1, awaiting_description=True
+                    )
+                    items.append(item)
+                    continue
+                rm_c = self._match_prefixed_code_amounts(line) if line else None
+                if rm_c:
+                    item = self._item_from_code_amounts(rm_c, local_schedule, None)
                     item.source_pos = region_offset + line_offsets[i]
                     pg = page_at(line_offsets[i])
                     if pg:
@@ -946,6 +1626,9 @@ class ProductExtractor:
             if re.search(r"(?i)^(?:schedule\s+)?(?:total|grand\s+total)\b", line):
                 blocked = True
                 continue
+            if ITEM_BREAKUP_HEADING.match(line):
+                blocked = True
+                continue
             if blocked:
                 continue
 
@@ -961,6 +1644,10 @@ class ProductExtractor:
                     continue
                 item = self._find_row_above(lines, idx)
                 if item is None:
+                    # Bare "4 Description:-" after a page break is a restated
+                    # serial, not a new product. Don't invent a qty-less row.
+                    if re.fullmatch(r"\d{1,4}", cd.group("code") or ""):
+                        continue
                     item = ProductItem(
                         item_code=self._normalize_item_code(cd.group("code")),
                         description=truncate(desc, _DESC_MAX),
@@ -986,8 +1673,10 @@ class ProductExtractor:
             if item is None:
                 continue  # don't invent orphan description-only rows
             item.description = full_desc
-            if not item.item_code and item.s_no:
-                item.item_code = item.s_no
+            lead = re.match(r"^\s*(\d{1,4})\s+description", line, re.I)
+            if lead and not item.s_no:
+                item.s_no = str(int(lead.group(1)))
+            self._apply_default_item_code(item)
             if item.source_pos is None:
                 item.source_pos = line_offsets[idx]
             pg = page_at(line_offsets[idx])
@@ -1014,6 +1703,31 @@ class ProductExtractor:
             if re.match(r"(?i)^schedule\b", prev) and "item qty" not in prev.lower():
                 schedule = self._clean_schedule_title(prev)
                 continue
+            rm_letter = LETTER_CODE_AMOUNTS.match(prev)
+            if rm_letter:
+                item = self._item_from_letter_amounts(rm_letter, schedule, None)
+                for mid in range(k + 1, desc_idx):
+                    alone = re.fullmatch(r"(\d{1,4})", lines[mid].strip())
+                    if alone and not item.s_no:
+                        item.s_no = str(int(alone.group(1)))
+                        break
+                return item
+            rm_ptr = POINTER_AMOUNTS.match(prev)
+            if rm_ptr:
+                letter = self._schedule_letter(schedule)
+                item = ProductItem(
+                    item_code=letter.upper() if letter else None,
+                    amount=rm_ptr.group("amount"),
+                    basic_value=rm_ptr.group("amount"),
+                    escalation=collapse_whitespace(rm_ptr.group("escl")),
+                    schedule=schedule,
+                )
+                for mid in range(k + 1, desc_idx):
+                    alone = re.fullmatch(r"(\d{1,4})", lines[mid].strip())
+                    if alone and not item.s_no:
+                        item.s_no = str(int(alone.group(1)))
+                        break
+                return item
             rm_b = FLEX_SCHEDULE_ROW.match(prev)
             if rm_b:
                 return self._item_from_flex(rm_b, schedule, None)
@@ -1050,48 +1764,24 @@ class ProductExtractor:
                     bidding_unit=rm_amt.groupdict().get("bidunit"),
                     schedule=schedule,
                 )
-            # "NS1 730.00 Day 954.00 ..." without S.No. on same line
-            code_row = re.match(
-                rf"(?i)^\s*(?P<code>{_CODE})\s+"
-                rf"(?P<qty>[\d,]+\.\d{{2}})\s+"
-                rf"(?P<unit>{_UNIT})\s+"
-                rf"(?P<rate>[\d,]+\.\d{{2}})\s+"
-                rf"(?P<basic>[\d,]+\.\d{{2}})\s+"
-                rf"(?P<escl>AT\s*Par|[\d,]+\.?\d*\s*%?)\s+"
-                rf"(?P<amount>[\d,]+\.\d{{2}})\s*"
-                rf"(?P<bidunit>Rs\.?|INR)?\s*$",
-                prev,
-            )
-            if code_row:
-                # S.No. may be alone on the line above
-                sno = None
-                for up in range(k - 1, max(-1, k - 4), -1):
-                    if up < 0:
-                        break
-                    alone = re.match(r"^\s*(\d{1,4})\s*$", lines[up].strip())
-                    if alone:
-                        sno = alone.group(1)
-                        break
-                return ProductItem(
-                    s_no=sno,
-                    item_code=self._normalize_item_code(code_row.group("code")),
-                    item_qty=code_row.group("qty"),
-                    qty_unit=code_row.group("unit"),
-                    unit_rate=code_row.group("rate"),
-                    basic_value=code_row.group("basic"),
-                    escalation=collapse_whitespace(code_row.group("escl")),
-                    amount=code_row.group("amount"),
-                    bidding_unit=code_row.groupdict().get("bidunit"),
-                    schedule=schedule,
-                )
+            rm_c = self._match_prefixed_code_amounts(prev)
+            if rm_c:
+                item = self._item_from_code_amounts(rm_c, schedule, None)
+                if not item.s_no:
+                    for up in range(k - 1, max(-1, k - 4), -1):
+                        if up < 0:
+                            break
+                        alone = re.match(r"^\s*(\d{1,4})\s*$", lines[up].strip())
+                        if alone:
+                            item.s_no = str(int(alone.group(1)))
+                            break
+                return item
         return None
 
     @staticmethod
     def _clean_schedule_title(line: str) -> str:
-        """Keep schedule name; drop trailing schedule total amount if present."""
-        title = collapse_whitespace(line) or line.strip()
-        title = re.sub(r"\s+[\d,]+\.\d{2}\s*$", "", title).strip()
-        return title
+        """Keep schedule name; drop IREPS chrome and trailing totals."""
+        return clean_schedule_title(line)
 
     @staticmethod
     def _item_from_ireps_no_code(
@@ -1162,7 +1852,27 @@ class ProductExtractor:
         offset that's only meaningful within that one chunk.
         """
         chunks: list[tuple[int, str]] = []
-        matches = list(re.finditer(r"(?im)^(?P<title>schedule\b(?!\s*total)[^\n]*)", text))
+        breakup_spans: list[tuple[int, int]] = []
+        for bm in re.finditer(r"(?im)^(?:\d+\.\s*)?item\s+breakup\b", text):
+            rest = text[bm.end() :]
+            end_m = re.search(
+                r"(?im)^(?:\d+\.\s*)?(?:eligibility|standard\s+financial|"
+                r"general\s+conditions|special\s+conditions|"
+                r"instructions\s+to\s+bidders)\b",
+                rest,
+            )
+            breakup_spans.append(
+                (bm.start(), bm.end() + (end_m.start() if end_m else min(len(rest), 12000)))
+            )
+
+        def _in_breakup(pos: int) -> bool:
+            return any(a <= pos < b for a, b in breakup_spans)
+
+        matches = [
+            m
+            for m in re.finditer(r"(?im)^(?P<title>schedule\b(?!\s*total)[^\n]*)", text)
+            if not _in_breakup(m.start())
+        ]
         for idx, m in enumerate(matches):
             start = m.start()
             end = matches[idx + 1].start() if idx + 1 < len(matches) else min(len(text), start + 30000)
@@ -1206,6 +1916,7 @@ class ProductExtractor:
 
     def _merge_all(self, items: list[ProductItem]) -> list[ProductItem]:
         """Union all items; hard-dedupe so the same row never repeats."""
+        items = self._retag_breakup_items(list(items))
         merged: dict[tuple[Any, ...], ProductItem] = {}
 
         for item in items:
@@ -1218,7 +1929,9 @@ class ProductExtractor:
                 continue
             merged[key] = self._prefer_item(merged[key], item)
 
-        # Second pass: same schedule letter + S.No. must be one row
+        # Second pass: same schedule letter + S.No. must be one row —
+        # except letter-prefixed codes (NS4) which keep their own identity
+        # even when they share a serial with a Schedule A/B/C SOR item.
         by_sno: dict[tuple[Any, ...], ProductItem] = {}
         for item in merged.values():
             sk = self._schedule_sno_key(item)
@@ -1229,10 +1942,23 @@ class ProductExtractor:
             if sk not in by_sno:
                 by_sno[sk] = item
                 continue
-            by_sno[sk] = self._prefer_item(by_sno[sk], item)
+            existing = by_sno[sk]
+            if self._codes_conflict(existing, item):
+                extra = (
+                    self._normalize_item_code(item.item_code) or ""
+                ).lower() or id(item)
+                by_sno[sk + ("code", extra)] = item
+                continue
+            by_sno[sk] = self._prefer_item(existing, item)
 
         out = list(by_sno.values())
+        out = self._fold_prefixed_serial_stubs(out)
+        out = self._fold_serial_stubs(out)
+        out = self._fold_same_letter_amounts(out)
+        out = self._repair_duplicate_serials(out)
         out.sort(key=self._sort_key)
+        out = self._retag_prefixed_schedules(out, "")
+        out = self._retag_breakup_items(out)
 
         for p in out:
             if p.escalation:
@@ -1242,10 +1968,226 @@ class ProductExtractor:
             if not p.bidding_unit or str(p.bidding_unit).lower() in {"none", "null"}:
                 p.bidding_unit = None
             if p.description:
-                p.description = p.description.lstrip("-–— ").strip()
+                p.description = clean_item_description(p.description) or p.description.lstrip(
+                    "-–— "
+                ).strip()
             if p.schedule:
                 p.schedule = self._clean_schedule_title(p.schedule)
+            self._apply_default_item_code(p)
+        self._promote_letter_item_codes(out)
+        self._link_item_breakups(out)
+        out.sort(key=self._sort_key)
         return out
+
+    def _repair_duplicate_serials(self, items: list[ProductItem]) -> list[ProductItem]:
+        """If two rows share a schedule serial, prefer the NS/A1 suffix of the extra row."""
+        from collections import defaultdict
+
+        groups: dict[tuple[str, int], list[ProductItem]] = defaultdict(list)
+        used: set[tuple[str, int]] = set()
+        for p in items:
+            letter = self._schedule_letter(p.schedule) or (p.schedule or "")
+            if self._is_breakup_schedule(p.schedule):
+                letter = p.schedule or letter
+            if not is_list_serial(p.s_no):
+                continue
+            key = (letter, int(str(p.s_no).strip()))
+            groups[key].append(p)
+            used.add(key)
+
+        for (letter, sno), group in groups.items():
+            if len(group) < 2:
+                continue
+            for p in group:
+                pref = self._serial_from_prefixed_code(p.item_code)
+                if not pref:
+                    continue
+                n = int(pref)
+                if n == sno:
+                    continue
+                alt = (letter, n)
+                if alt not in used:
+                    p.s_no = pref
+                    used.add(alt)
+        return items
+
+    def _fold_prefixed_serial_stubs(
+        self, items: list[ProductItem]
+    ) -> list[ProductItem]:
+        """
+        IREPS wraps the serial onto the next page as '21 Description:- …'.
+        That stub must not survive as a separate qty-less product beside NS21.
+        """
+        hosts: dict[str, ProductItem] = {}
+        for p in items:
+            serial = self._serial_from_prefixed_code(p.item_code)
+            if not serial:
+                continue
+            if (p.item_qty and re.search(r"\d", p.item_qty)) or (
+                p.unit_rate and re.search(r"\d", p.unit_rate)
+            ) or (p.amount and re.search(r"\d", p.amount)):
+                hosts[serial] = p
+        if not hosts:
+            return items
+
+        out: list[ProductItem] = []
+        for p in items:
+            code = self._normalize_item_code(p.item_code) or ""
+            if self._is_prefixed_code(code):
+                out.append(p)
+                continue
+            sno = (p.s_no or "").strip()
+            has_qty = bool(p.item_qty and re.search(r"\d", p.item_qty))
+            has_money = bool(
+                (p.unit_rate and re.search(r"\d", p.unit_rate))
+                or (p.amount and re.search(r"\d", p.amount))
+            )
+            host = hosts.get(str(int(sno))) if sno.isdigit() and not has_qty and not has_money else None
+            if host is None:
+                out.append(p)
+                continue
+            same_letter = self._schedule_letter(host.schedule) == self._schedule_letter(
+                p.schedule
+            )
+            if not same_letter and p.schedule and host.schedule:
+                out.append(p)
+                continue
+            host_desc = self._norm_desc(host.description)
+            stub_desc = self._norm_desc(p.description)
+            related = (
+                not host_desc
+                or not stub_desc
+                or host_desc[:40] in stub_desc
+                or stub_desc[:40] in host_desc
+            )
+            if related and self._code_belongs_to_item(host, sno):
+                self._prefer_item(host, p)
+                continue
+            out.append(p)
+        return out
+
+    def _fold_serial_stubs(self, items: list[ProductItem]) -> list[ProductItem]:
+        """Merge a qty-less Description stub into the priced row with the same serial."""
+        hosts: dict[tuple[Any, ...], ProductItem] = {}
+        for p in items:
+            sk = self._schedule_sno_key(p)
+            if sk is None:
+                continue
+            has_money = bool(
+                (p.item_qty and re.search(r"\d", p.item_qty))
+                or (p.unit_rate and re.search(r"\d", p.unit_rate))
+                or (p.amount and re.search(r"\d", p.amount))
+            )
+            if has_money:
+                hosts[sk] = p
+
+        out: list[ProductItem] = []
+        for p in items:
+            sk = self._schedule_sno_key(p)
+            has_money = bool(
+                (p.item_qty and re.search(r"\d", p.item_qty))
+                or (p.unit_rate and re.search(r"\d", p.unit_rate))
+                or (p.amount and re.search(r"\d", p.amount))
+            )
+            has_desc = bool((p.description or "").strip())
+            host = hosts.get(sk) if sk and not has_money and has_desc else None
+            if host is None or host is p:
+                out.append(p)
+                continue
+            self._prefer_item(host, p)
+            continue
+        return out
+
+    def _fold_same_letter_amounts(self, items: list[ProductItem]) -> list[ProductItem]:
+        """Collapse duplicate letter-code rows that share qty/rate/amount.
+
+        Item Code A/B is the schedule letter, so many real lines can share the
+        same amounts (e.g. items 51 and 52). Those stay separate when their
+        descriptions differ. Amounts-only / unscheduled copies of the same
+        description are absorbed.
+        """
+        from collections import defaultdict
+
+        buckets: dict[tuple[str, str, str, str], list[ProductItem]] = defaultdict(list)
+        others: list[ProductItem] = []
+        for p in items:
+            code = (self._normalize_item_code(p.item_code) or "").lower()
+            qty = self._norm_num(p.item_qty)
+            rate = self._norm_num(p.unit_rate)
+            amount = self._norm_num(p.amount)
+            if self._is_schedule_letter_code(code) and qty and rate and amount:
+                buckets[(code, qty, rate, amount)].append(p)
+            else:
+                others.append(p)
+
+        keep: list[ProductItem] = []
+        drop: set[int] = set()
+        for group in buckets.values():
+            if len(group) == 1:
+                keep.extend(group)
+                continue
+            scheduled = [p for p in group if self._schedule_letter(p.schedule)]
+            if scheduled and len(scheduled) < len(group):
+                for p in group:
+                    if p not in scheduled:
+                        drop.add(id(p))
+                group = scheduled
+                if len(group) == 1:
+                    keep.extend(group)
+                    continue
+            by_desc: dict[str, list[ProductItem]] = defaultdict(list)
+            for p in group:
+                by_desc[self._norm_desc(p.description)].append(p)
+            empty = by_desc.pop("", [])
+            distinct = {d: hs for d, hs in by_desc.items() if d}
+
+            def _host_of(hs: list[ProductItem]) -> ProductItem:
+                return max(
+                    hs,
+                    key=lambda x: (
+                        bool(self._schedule_letter(x.schedule)),
+                        bool((x.description or "").strip()),
+                        is_list_serial(x.s_no),
+                        len(x.description or ""),
+                    ),
+                )
+
+            for hs in distinct.values():
+                host = _host_of(hs)
+                saved_sno = host.s_no
+                saved_sched = host.schedule
+                for q in hs:
+                    if q is host:
+                        continue
+                    self._prefer_item(host, q)
+                    drop.add(id(q))
+                if saved_sched:
+                    host.schedule = saved_sched
+                if is_list_serial(saved_sno):
+                    host.s_no = saved_sno
+                keep.append(host)
+
+            if empty:
+                if len(distinct) == 1:
+                    host = keep[-1]
+                    for q in empty:
+                        self._prefer_item(host, q)
+                        drop.add(id(q))
+                elif not distinct:
+                    host = _host_of(empty)
+                    for q in empty:
+                        if q is host:
+                            continue
+                        self._prefer_item(host, q)
+                        drop.add(id(q))
+                    keep.append(host)
+                else:
+                    # Same amounts, two different descriptions already kept;
+                    # leftover amounts-only rows are ghosts.
+                    for q in empty:
+                        drop.add(id(q))
+
+        return [p for p in items if id(p) not in drop]
 
     def _backfill_missing_descriptions(
         self, products: list[ProductItem], text: str
@@ -1320,6 +2262,9 @@ class ProductExtractor:
             if re.search(r"(?i)^(?:schedule\s+)?(?:total|grand\s+total)\b", line):
                 blocked = True
                 continue
+            if ITEM_BREAKUP_HEADING.match(line):
+                blocked = True
+                continue
             if blocked:
                 continue
             if not DESCRIPTION_LINE.match(line):
@@ -1345,41 +2290,21 @@ class ProductExtractor:
         return out
 
     def _sort_key(self, p: ProductItem) -> tuple:
-        """
-        Group by schedule (falling back to item-code prefix, e.g. NS/B/A, when
-        no schedule was captured), then order by true document position within
-        each group — exact character offset when known (`source_pos`), else
-        the real page number. A correctly-extracted S.No. already increases
-        through the document, so position-based ordering reproduces S.No.
-        order for well-formed schedules for free; it also avoids the failure
-        mode where exactly one row in a group happened to have its S.No.
-        captured (siblings didn't) and got yanked to the front of the group
-        out of its true position just because it had a number and they didn't.
-        S.No. is only used as the ordering signal when NO position info is
-        available at all (e.g. hand-built ProductItems in unit tests), falling
-        back further to stable original extraction order when even that is
-        absent. This whole scheme replaces the old fallback of sorting by
-        item_qty, which scrambled the list into a qty-lexicographic jumble
-        whenever S.No. was missing.
-        """
+        """Group by schedule, then S.No., then document position."""
         group = self._group_key(p)
-        page = min(p.page_numbers) if p.page_numbers else None
+        sno = int(str(p.s_no).strip()) if is_list_serial(p.s_no) else 10**9
         if p.source_pos is not None:
-            position_rank, position_value = 0, p.source_pos
-        elif page is not None:
-            position_rank, position_value = 1, page
+            pos = p.source_pos
+        elif p.page_numbers:
+            pos = min(p.page_numbers) * 10**6
         else:
-            position_rank, position_value = 2, 0
-
-        if position_rank < 2:
-            return (group, position_rank, position_value, 0, 0)
-
-        sno = None
-        if p.s_no and p.s_no.strip().isdigit():
-            sno = int(p.s_no.strip())
-        return (group, position_rank, position_value, 0 if sno is not None else 1, sno or 0)
+            pos = 10**12
+        return (group, sno, pos)
 
     def _group_key(self, p: ProductItem) -> tuple[int, str]:
+        if self._is_breakup_schedule(p.schedule):
+            parent = self._breakup_parent_sno(p.schedule) or "0"
+            return (1, parent.zfill(4))
         letter = self._schedule_letter(p.schedule)
         if letter:
             return (0, letter)
@@ -1388,8 +2313,8 @@ class ProductExtractor:
         code = (p.item_code or "").strip()
         m = re.match(r"^([A-Za-z]+)", code)
         if m:
-            return (1, m.group(1).upper())
-        return (2, "")
+            return (2, m.group(1).upper())
+        return (3, "")
 
     @staticmethod
     def _schedule_letter(schedule: str | None) -> str:
@@ -1405,10 +2330,20 @@ class ProductExtractor:
         return ""
 
     def _schedule_sno_key(self, item: ProductItem) -> tuple[Any, ...] | None:
+        code = self._normalize_item_code(item.item_code) or ""
+        if self._is_breakup_schedule(item.schedule):
+            parent = self._breakup_parent_sno(item.schedule) or ""
+            sno = (item.s_no or "").strip()
+            if sno.isdigit():
+                return ("breakup", parent, int(sno))
+            return None
+        letter = self._schedule_letter(item.schedule)
+        # NS4 / A1 / B12 must not share a key with numeric SOR item 4 / 1 / 12.
+        if self._is_prefixed_code(code):
+            return ("sched_code", letter or "", code.lower())
         sno = (item.s_no or "").strip()
         if not sno.isdigit():
             return None
-        letter = self._schedule_letter(item.schedule)
         if letter:
             return ("sched_sno", letter, int(sno))
         # No schedule: identity still held by content key; don't collapse A#1 with B#1
@@ -1454,6 +2389,13 @@ class ProductExtractor:
 
         # Prefer identity that includes item code (IREPS S.No. ≈ Item Code)
         if code and qty and rate:
+            if len(code) == 1 and code.isalpha():
+                # Many SOR rows share Item Code A/B; serial (or description) distinguishes them.
+                if sno:
+                    return ("crt", code, sno, qty, rate)
+                if desc:
+                    return ("qrad", code, qty, rate, amount, desc)
+                return ("qra", code, qty, rate, amount)
             return ("crt", code, qty, rate)
         if sno and qty and rate and amount:
             return ("sqra", sno, qty, rate, amount)
@@ -1472,6 +2414,8 @@ class ProductExtractor:
         # Prefer longer description
         if (b.description or "") and len(b.description or "") > len(a.description or ""):
             a.description = b.description
+        conflict = self._codes_conflict(a, b)
+        money_attrs = {"item_qty", "qty_unit", "unit_rate", "basic_value", "amount"}
         for attr in (
             "item_code",
             "item_qty",
@@ -1484,8 +2428,23 @@ class ProductExtractor:
             "schedule",
             "product_name",
         ):
+            if attr == "item_code" and conflict:
+                continue
+            if conflict and attr in money_attrs:
+                continue
             if not getattr(a, attr) and getattr(b, attr):
                 setattr(a, attr, getattr(b, attr))
+
+        # NS items must keep the NS / Schedule D title when a duplicate
+        # extract carried leftover Schedule A from a continuation page.
+        merged_code = self._normalize_item_code(a.item_code) or self._normalize_item_code(
+            b.item_code
+        )
+        if merged_code and re.match(r"^NS\d+$", merged_code, re.I):
+            if self._schedule_looks_like_ns(b.schedule) and not self._schedule_looks_like_ns(
+                a.schedule
+            ):
+                a.schedule = b.schedule
 
         # Prefer S.No. that matches item_code (common in IREPS)
         a_sno = (a.s_no or "").strip()
@@ -1527,22 +2486,22 @@ class ProductExtractor:
 
     @staticmethod
     def _normalize_serial(item: ProductItem) -> ProductItem:
+        prefixed = ProductExtractor._serial_from_prefixed_code(item.item_code)
         sno = (item.s_no or "").strip()
+        if is_list_serial(sno):
+            item.s_no = str(int(sno))
+            return item
+        if prefixed:
+            item.s_no = prefixed
+            return item
         if not sno:
-            # If item_code is a simple integer, use it as s_no
+            # Only copy a short list serial from the item code — never a
+            # 5–6 digit railway SOR code (051010) into itemSerialNo.
             code = (item.item_code or "").strip()
-            if code.isdigit() and int(code) > 0:
+            if is_list_serial(code):
                 item.s_no = str(int(code))
             return item
-        if not sno.isdigit():
-            item.s_no = None
-            return item
-        n = int(sno)
-        if n <= 0:
-            item.s_no = None
-            return item
-        # Normalize "01" -> "1"
-        item.s_no = str(n)
+        item.s_no = None
         return item
 
     @staticmethod
@@ -1616,12 +2575,31 @@ class ProductExtractor:
     def _schedule_from_headers_or_rows(table: ExtractedTable) -> str | None:
         for cell in table.headers:
             if re.search(r"(?i)^schedule\b", cell or ""):
-                return collapse_whitespace(cell)
+                return ProductExtractor._clean_schedule_title(cell)
         for row in table.rows[:5]:
             joined = " ".join(c for c in row if c)
             if re.search(r"(?i)^schedule\b", joined) and "item qty" not in joined.lower():
-                return collapse_whitespace(joined)
+                if re.search(r"(?i)^(?:schedule\s+)?(?:total|grand\s+total)\b", joined):
+                    continue
+                return ProductExtractor._clean_schedule_title(joined)
         return None
+
+    @staticmethod
+    def _last_schedule_title_in_table(table: ExtractedTable) -> str | None:
+        """Last real schedule caption in this table (for continuation inheritance)."""
+        last: str | None = None
+        for cell in table.headers:
+            if re.search(r"(?i)^schedule\b", cell or "") and "item qty" not in (cell or "").lower():
+                if not re.search(r"(?i)^(?:schedule\s+)?(?:total|grand\s+total)\b", cell or ""):
+                    last = ProductExtractor._clean_schedule_title(cell)
+        for row in table.rows:
+            joined = " ".join(c for c in row if c).strip()
+            lower = joined.lower()
+            if lower.startswith("schedule") and "item qty" not in lower:
+                if re.search(r"(?i)^(?:schedule\s+)?(?:total|grand\s+total)\b", joined):
+                    continue
+                last = ProductExtractor._clean_schedule_title(joined)
+        return last
 
     # Backwards-compatible helpers used by merge.sanitize_products
     @staticmethod

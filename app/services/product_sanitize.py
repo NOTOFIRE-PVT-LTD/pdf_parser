@@ -14,6 +14,7 @@ from app.utils.product_name import (
     normalize_product_description,
     recheck_product_name,
 )
+from app.utils.text_utils import is_list_serial
 
 _JUNK_DESC = re.compile(
     r"(?i)^(s\.?no\.?|item\s*code|item\s*qty|description\s*:?-?|"
@@ -120,13 +121,30 @@ def sanitize_products(raw_products: list[Any]) -> list[ProductItem]:
         cleaned.append(ProductItem(**data))
 
     merged = ProductExtractor._normalize_schedule_items(cleaned)
-    return _renumber_sequential(merged)
+    merged = _renumber_sequential(merged)
+    merged.sort(key=ProductExtractor()._sort_key)
+    return merged
 
 
 def _renumber_sequential(items: list[ProductItem]) -> list[ProductItem]:
-    """Fill missing S.No. only — never overwrite a serial taken from the PDF."""
-    for idx, item in enumerate(items, start=1):
-        sno = str(item.s_no or "").strip()
-        if not sno:
-            item.s_no = str(idx)
+    """Fill missing S.No. per schedule — never overwrite a real list serial."""
+    from collections import defaultdict
+
+    used: dict[str, set[int]] = defaultdict(set)
+    for item in items:
+        key = ProductExtractor._schedule_letter(item.schedule) or (item.schedule or "")
+        if is_list_serial(item.s_no):
+            used[key].add(int(str(item.s_no).strip()))
+
+    next_n: dict[str, int] = defaultdict(lambda: 1)
+    for item in items:
+        if is_list_serial(item.s_no):
+            continue
+        key = ProductExtractor._schedule_letter(item.schedule) or (item.schedule or "")
+        n = next_n[key]
+        while n in used[key]:
+            n += 1
+        item.s_no = str(n)
+        used[key].add(n)
+        next_n[key] = n + 1
     return items

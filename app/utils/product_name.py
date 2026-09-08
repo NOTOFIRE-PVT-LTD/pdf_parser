@@ -138,6 +138,8 @@ _DROP_BACKBOX_AFTER_FOR = re.compile(
 def normalize_product_description(desc: str | None) -> str | None:
     if not desc:
         return None
+    from app.utils.text_utils import clean_item_description
+
     text = desc.strip()
     text = re.sub(r"\[\[PAGE:\d+\]\]", " ", text)
     text = _DESC_PREFIX.sub("", text).strip()
@@ -155,7 +157,7 @@ def normalize_product_description(desc: str | None) -> str | None:
         "",
         text,
     )
-    text = re.sub(r"\s+", " ", text).strip()
+    text = clean_item_description(text)
     return text or None
 
 

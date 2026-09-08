@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
+from openpyxl import Workbook
 
 from app.config import Settings, get_settings
 from app.models.schemas import ProductItem, TenderResult
@@ -26,8 +26,25 @@ from app.utils.product_name import (
     extract_item_warranty_period,
     normalize_product_description,
 )
+from app.utils.text_utils import clean_schedule_title
 
 _FORMULA_TRIGGER_CHARS = ("=", "+", "-", "@", "\t", "\r")
+_ILLEGAL_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+# IREPS prints dates as dd/mm/yyyy. Portals that parse with Date() treat
+# 25/08/2026 as an invalid US month and then drop every row.
+_PORTAL_DMY = re.compile(
+    r"^\s*(?P<d>\d{1,2})[/\-.](?P<m>\d{1,2})[/\-.](?P<y>\d{4})"
+    r"(?:\s+(?P<H>\d{1,2}):(?P<M>\d{2})(?::(?P<S>\d{2}))?)?"
+    r"(?:\s*(?:hrs?|hours?))?\s*$",
+    re.I,
+)
+_PORTAL_ISO = re.compile(
+    r"^\s*(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})"
+    r"(?:[T\s](?P<H>\d{1,2}):(?P<M>\d{2})(?::(?P<S>\d{2}))?)?"
+    r"(?:Z|[+-]\d{2}:\d{2})?\s*$",
+    re.I,
+)
 
 # Exact portal CSV template columns — order must not change.
 FLAT_EXCEL_COLUMNS: list[str] = [
@@ -112,6 +129,49 @@ class ExportService:
         return value
 
     @staticmethod
+    def _excel_value(value: Any) -> str:
+        if value is None:
+            return ""
+        return _ILLEGAL_XML.sub("", str(value))
+
+    @classmethod
+    def _portal_datetime(cls, value: Any) -> str | None:
+        """Normalize IREPS dd/mm/yyyy to ISO so portal Date() parsers accept the row."""
+        text = cls._cell(value)
+        if not text:
+            return None
+        raw = str(text).strip()
+        if re.search(r"(?i)\b(?:na|n/?a|nil|none|not\s+applicable|no)\b", raw) and not re.search(
+            r"\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}", raw
+        ):
+            return None
+        m = _PORTAL_ISO.match(raw) or _PORTAL_DMY.match(raw)
+        if not m:
+            return None
+        try:
+            year = int(m.group("y"))
+            month = int(m.group("m"))
+            day = int(m.group("d"))
+        except (TypeError, ValueError):
+            return None
+        if not (1 <= month <= 12 and 1 <= day <= 31 and 1900 <= year <= 2100):
+            return None
+        hour = m.groupdict().get("H")
+        minute = m.groupdict().get("M")
+        second = m.groupdict().get("S")
+        if hour is None:
+            return f"{year:04d}-{month:02d}-{day:02d}"
+        try:
+            hh = int(hour)
+            mm = int(minute or 0)
+            ss = int(second or 0)
+        except ValueError:
+            return f"{year:04d}-{month:02d}-{day:02d}"
+        if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
+            return f"{year:04d}-{month:02d}-{day:02d}"
+        return f"{year:04d}-{month:02d}-{day:02d}T{hh:02d}:{mm:02d}:{ss:02d}"
+
+    @staticmethod
     def _name_from_pdf(description: str | None, product_name: str | None) -> str | None:
         """Export a product name only if it is grounded in the PDF description."""
         name = ExportService._cell(product_name)
@@ -135,7 +195,9 @@ class ExportService:
             return None
         if t in {"y", "yes", "true", "required", "1"}:
             return "Yes"
-        if t in {"n", "no", "false", "not required", "0", "nil", "na", "n/a"}:
+        if t in {"n", "no", "false", "not required", "0", "nil", "na", "n/a", "not applicable"}:
+            return "No"
+        if re.search(r"(?i)not\s+applicable", t):
             return "No"
         # Keep PDF wording if it's already Yes/No-ish text
         if re.search(r"(?i)\byes\b", t) and not re.search(r"(?i)\bno\b", t):
@@ -155,10 +217,17 @@ class ExportService:
 
     def to_combined_excel_bytes(self, results: list[TenderResult]) -> bytes:
         rows = self._flat_rows(results)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Tender Data"
+        ws.append(list(FLAT_EXCEL_COLUMNS))
+        for row in rows:
+            ws.append([self._excel_value(row.get(col)) for col in FLAT_EXCEL_COLUMNS])
+        for col in ws.columns:
+            for cell in col:
+                cell.number_format = "@"
         buffer = io.BytesIO()
-        pd.DataFrame(rows, columns=FLAT_EXCEL_COLUMNS).to_excel(
-            buffer, sheet_name="Tender Data", index=False, engine="openpyxl"
-        )
+        wb.save(buffer)
         buffer.seek(0)
         return buffer.read()
 
@@ -170,12 +239,18 @@ class ExportService:
             buffer,
             fieldnames=FLAT_EXCEL_COLUMNS,
             extrasaction="ignore",
-            quoting=csv.QUOTE_ALL,
-            lineterminator="\n",
+            restval="",
+            quoting=csv.QUOTE_MINIMAL,
+            lineterminator="\r\n",
         )
         writer.writeheader()
-        writer.writerows(rows)
-        return buffer.getvalue().encode("utf-8-sig")
+        for row in rows:
+            writer.writerow(
+                {col: "" if row.get(col) is None else row.get(col) for col in FLAT_EXCEL_COLUMNS}
+            )
+        # UTF-8 without BOM: a leading EF BB BF makes some portals see the
+        # first column as "\ufefftitle" and then reject every row.
+        return buffer.getvalue().encode("utf-8")
 
     def _flat_rows(self, results: list[TenderResult]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -209,10 +284,15 @@ class ExportService:
             # PDF stated JV member count ⇒ JV is allowed; do not invent Yes otherwise
             jv_allowed = "Yes"
 
+        pre_bid_yn = self._yes_no(pre_bid_raw)
+        pre_bid_date = self._portal_datetime(pre_bid_date)
+        if pre_bid_yn == "No":
+            pre_bid_date = None
+
         return {
             "title": work,
             "tenderNo": self._cell(info.tender_no),
-            "referenceNo": self._cell(info.reference_no),
+            "referenceNo": self._cell(info.reference_no) or self._cell(info.tender_no),
             "description": work,
             "zone": self._cell(info.zone),
             "railway": self._cell(info.railway),
@@ -223,9 +303,9 @@ class ExportService:
             "tenderDocCost": self._cell(info.tender_doc_cost),
             "periodOfCompletion": self._cell(info.period_of_completion),
             "validityDays": self._cell(info.bid_validity_days),
-            "closingAt": self._cell(closing),
-            "publishedAt": self._cell(published),
-            "biddingStartDate": self._cell(start),
+            "closingAt": self._portal_datetime(closing),
+            "publishedAt": self._portal_datetime(published),
+            "biddingStartDate": self._portal_datetime(start),
             "pdfUrl": self._cell(info.pdf_url),
             "biddingType": self._cell(info.bidding_type),
             "tenderType": self._cell(info.tender_type),
@@ -235,8 +315,8 @@ class ExportService:
             "expenditureType": self._cell(info.expenditure_type),
             "biddingStyle": self._cell(info.bidding_style),
             "biddingUnit": None,
-            "preBidRequired": self._yes_no(pre_bid_raw),
-            "preBidDate": self._cell(pre_bid_date),
+            "preBidRequired": pre_bid_yn,
+            "preBidDate": pre_bid_date,
             "jvAllowed": jv_allowed,
             "jvMembersAllowed": jv_members,
             "consortiumAllowed": self._yes_no(info.consortium_allowed),
@@ -264,14 +344,16 @@ class ExportService:
             {
                 "biddingUnit": self._cell(product.bidding_unit),
                 "itemSerialNo": self._cell(product.s_no),
-                "itemCode": self._cell(product.item_code),
+                "itemCode": self._cell(product.item_code) or self._cell(product.s_no),
                 "itemDescription": self._cell(full_desc),
                 "itemQty": self._cell(product.item_qty),
                 "itemUnit": self._cell(product.qty_unit),
                 "itemUnitRate": self._cell(product.unit_rate),
                 "itemBasicValue": self._cell(product.basic_value),
                 "itemAmount": self._cell(product.amount),
-                "itemCategory": self._cell(product.schedule),
+                "itemCategory": self._cell(
+                    clean_schedule_title(product.schedule) if product.schedule else None
+                ),
                 "itemSpecNumber": self._cell(spec_no),
                 "itemDrawingNumber": self._cell(drawing),
                 "itemMakeBrand": self._cell(make),

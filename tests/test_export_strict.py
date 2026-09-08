@@ -31,7 +31,7 @@ def test_export_leaves_missing_fields_null_not_guessed():
     row = ExportService().build_flat_rows(result)[0]
 
     assert row["status"] is None
-    assert row["referenceNo"] is None
+    assert row["referenceNo"] == "T-99"
     assert row["railway"] is None
     assert row["zone"] == "WESTERN"
     assert row["jvMembersAllowed"] == "3"
@@ -40,6 +40,7 @@ def test_export_leaves_missing_fields_null_not_guessed():
     assert row["productName"] == "Widget A"
     assert row["itemDescription"] == "Supply of Widget A"
     assert row["itemSerialNo"] == "1"
+    assert row["itemCode"] == "1"
     assert row["itemUnitRate"] == "100.00"
     assert row["itemAmount"] == "1000.00"
     assert row["biddingUnit"] is None
@@ -81,19 +82,49 @@ def test_csv_header_matches_template_exactly():
     )
     exporter = ExportService()
     csv_bytes = exporter.to_csv_bytes(result, which="products")
-    text = csv_bytes.decode("utf-8-sig")
-    header = text.splitlines()[0]
-    expected = ",".join(f'"{c}"' for c in FLAT_EXCEL_COLUMNS)
+    assert not csv_bytes.startswith(b"\xef\xbb\xbf")
+    text = csv_bytes.decode("utf-8")
+    header = text.splitlines()[0].strip("\r")
+    expected = ",".join(FLAT_EXCEL_COLUMNS)
     assert header == expected
     assert FLAT_EXCEL_COLUMNS[11] == "periodOfCompletion"
     assert FLAT_EXCEL_COLUMNS[12] == "validityDays"
     assert FLAT_EXCEL_COLUMNS[-1] == "productName"
+    assert "parent_s_no" not in FLAT_EXCEL_COLUMNS
+    assert "parentSNo" not in FLAT_EXCEL_COLUMNS
     assert '"Supply of GSM module for Control panel, with accessories"' in text
     rows = list(csv.DictReader(io.StringIO(text)))
     assert len(rows) == 1
     assert rows[0]["itemQty"] == "1"
     assert rows[0]["itemAmount"] == "100"
     assert rows[0]["productName"] == "GSM module for Control panel"
+
+
+def test_portal_dates_are_iso_and_invalid_prebid_dropped():
+    result = TenderResult(
+        tender_information=TenderInformation(
+            name_of_work="Work",
+            tender_no="T-1",
+            closing_date_time="08/09/2026 14:00",
+            bidding_start_date="25/08/2026",
+            pre_bid_required="No",
+            pre_bid_date="No Not Applicable",
+        ),
+        products=[
+            ProductItem(s_no="1", description="Supply of Widget A", item_qty="1.00"),
+        ],
+    )
+    row = ExportService().build_flat_rows(result)[0]
+    assert row["closingAt"] == "2026-09-08T14:00:00"
+    assert row["biddingStartDate"] == "2026-08-25"
+    assert row["preBidRequired"] == "No"
+    assert row["preBidDate"] is None
+
+    csv_bytes = ExportService().to_csv_bytes(result, which="products")
+    parsed = list(csv.DictReader(io.StringIO(csv_bytes.decode("utf-8"))))
+    assert parsed[0]["closingAt"] == "2026-09-08T14:00:00"
+    assert parsed[0]["preBidDate"] == ""
+    assert parsed[0]["itemSerialNo"] == "1"
 
 
 def test_rejects_ungrounded_product_name():

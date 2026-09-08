@@ -37,12 +37,16 @@ from app.utils.text_utils import collapse_whitespace, truncate
 class FieldExtractor:
     """Extract structured tender fields from plain text."""
 
-    # Labels that commonly follow "Name of Work" in NIT HEADER tables
+    # Labels that sit beside each other on IREPS NIT HEADER rows
     _NIT_NEXT_LABELS = (
         r"bidding\s*type|tender\s*type|bidding\s*system|tender\s*closing|"
         r"advertised\s*value|tendering\s*section|earnest\s*money|"
-        r"period\s+of\s+completion|contract\s*type|pre-?bid|"
-        r"date\s*time\s*of\s*uploading|validity\s+of\s+offer"
+        r"period\s+of\s+completion|contract\s*type|contract\s*category|"
+        r"pre-?bid|date\s*time\s*of\s*uploading|validity\s+of\s+offer|"
+        r"bidding\s*style|bidding\s*unit|tender\s*doc(?:ument)?\.?\s*cost|"
+        r"bidding\s*start\s*date|are\s+jv|are\s+consortium|"
+        r"number\s+of\s+jv|number\s+of\s+consortium|ranking\s*order|"
+        r"expenditure\s*type|name\s+of\s+work|tender\s*no|closing\s*date"
     )
 
     # Stop words that must never be part of Tender No
@@ -150,6 +154,11 @@ class FieldExtractor:
             ("published_date", r"Date\s*Time\s*Of\s*Uploading\s*Tender"),
             ("pre_bid_required", r"Pre-Bid\s*Conference\s*Required"),
             ("jv_allowed", r"Are\s*JV\s*allowed\s*to\s*bid"),
+            ("consortium_allowed", r"Are\s*Consortium\s*allowed\s*to\s*bid"),
+            ("consortium_members_allowed", r"Number\s+of\s+Consortium\s+Member"),
+            ("ranking_order", r"Ranking\s*Order\s*For\s*Bids"),
+            ("tender_type", r"Tender\s*Type"),
+            ("bidding_type", r"Bidding\s*type"),
         ):
             if data.get(field):
                 continue
@@ -158,7 +167,7 @@ class FieldExtractor:
                 text,
             )
             if m:
-                val = collapse_whitespace(m.group("val"))
+                val = self._clip_nit_value(collapse_whitespace(m.group("val")))
                 if val and not self._is_placeholder(val) and not self._looks_like_label(val):
                     data[field] = truncate(val, 200)
 
@@ -212,6 +221,18 @@ class FieldExtractor:
                 data["railway"] = cleaned_r
             else:
                 data["railway"] = None
+
+        # Clip NIT values that swallowed the next label on the same line
+        for key, value in list(data.items()):
+            if not value or key in {"name_of_work", "tender_no"}:
+                continue
+            clipped = self._clip_nit_value(str(value))
+            if clipped:
+                data[key] = clipped
+
+        # IREPS has no separate reference number — portal templates reuse Tender No
+        if not data.get("reference_no") and data.get("tender_no"):
+            data["reference_no"] = data["tender_no"]
 
         # GeM cleanup: drop bogus advertised/zone scrapes
         from app.utils.portal import detect_portal
@@ -564,7 +585,13 @@ class FieldExtractor:
     def _extract_nit_header_block(self, text: str) -> dict[str, str | None]:
         """Pull labeled fields from the '1. NIT HEADER' section when present."""
         out: dict[str, str | None] = {}
-        m = re.search(r"(?is)(?:\d+\.\s*)?nit\s*header\b(.*?)(?=\n\s*(?:\d+\.\s*)?[A-Z][A-Za-z ].{0,40}\n|\Z)", text)
+        m = re.search(
+            r"(?is)(?:\d+\.\s*)?nit\s*header\b(.*?)(?="
+            r"\n\s*(?:\d+\.\s+)?(?:payment\s*terms|schedule\b|important\s+dates|"
+            r"eligibility|documents?\s+required|bill\s+of\s+quantit|"
+            r"general\s+conditions|special\s+conditions)\b|\Z)",
+            text,
+        )
         block = m.group(1) if m else text[:6000]
 
         # Name of Work first (longest field)
@@ -575,7 +602,7 @@ class FieldExtractor:
             "earnest_money": r"earnest\s*money(?:\s*\(?\s*rs\.?\s*\)?)?",
             "period_of_completion": r"period\s+of\s+completion",
             "number_of_jv_member_allowed": r"number\s+of\s+jv\s+member(?:s)?\s+allowed",
-            "jv_allowed": r"(?:are\s+)?jv(?:s)?\s+allowed|joint\s+venture\s+allowed",
+            "jv_allowed": r"(?:are\s+)?jv(?:s)?\s+allowed(?:\s+to\s+bid)?",
             "closing_date_time": r"tender\s*closing\s*date(?:\s*time)?|closing\s*date(?:\s*/?\s*time)?",
             "bidding_type": r"bidding\s*type",
             "tender_type": r"tender\s*type",
@@ -583,7 +610,7 @@ class FieldExtractor:
             "tender_doc_cost": r"tender\s*doc\.?\s*cost(?:\s*\(?\s*rs\.?\s*\)?)?",
             "bid_validity_days": r"validity\s+of\s+offer(?:\s*\(?\s*days?\s*\)?)?",
             "bidding_system": r"bidding\s*system",
-            "tendering_section": r"tendering\s*section|bidding\s*system",
+            "tendering_section": r"tendering\s*section",
             "pre_bid_conference": r"pre-?bid\s+conference(?:\s+required)?",
             "pre_bid_required": r"pre-?bid\s+(?:conference\s+)?required",
             "pre_bid_date": r"pre-?bid\s+(?:conference\s+)?date",
@@ -591,12 +618,12 @@ class FieldExtractor:
             "contract_category": r"contract\s*category",
             "expenditure_type": r"expenditure\s*type",
             "published_date": r"date\s*time\s*of\s*uploading\s*tender|uploading\s*tender",
-            "bidding_start_date": r"(?:document\s*)?download\s*start|bidding\s*start|bid\s*submission\s*start",
+            "bidding_start_date": r"bidding\s*start(?:\s*date)?",
             "reference_no": r"reference\s*(?:no\.?|number)",
             "status": r"tender\s*status|status\s*of\s*tender",
-            "consortium_allowed": r"consortium\s+allowed",
-            "consortium_members_allowed": r"number\s+of\s+consortium\s+member",
-            "ranking_order": r"ranking\s*order",
+            "consortium_allowed": r"(?:are\s+)?consortium\s+allowed(?:\s+to\s+bid)?",
+            "consortium_members_allowed": r"number\s+of\s+consortium\s+member(?:s)?\s+allowed",
+            "ranking_order": r"ranking\s*order(?:\s+for\s+bids)?",
             "signing_authority_name": r"(?:signing\s+)?authority\s*name|name\s+of\s+(?:the\s+)?authority",
             "signing_authority_designation": r"(?:signing\s+)?authority\s*designation|designation\s+of\s+(?:the\s+)?authority",
             "pdf_url": r"(?:tender\s+)?(?:pdf\s*)?url|document\s*url",
@@ -613,16 +640,15 @@ class FieldExtractor:
                 hint = "datetime"
             if field == "bid_validity_days":
                 hint = "days"
-            # Same-line: Label <spaces> Value  (common in 4-column NIT tables)
+            # Same-line: Label Value  (IREPS 4-column NIT tables often have
+            # only a single space before the next label)
             pm = re.search(
                 rf"(?im)(?:{label})\s*[:\-–]?\s+(?P<val>\S[^\n]*?)(?=\s{{2,}}[A-Z][a-z]|\s{{2,}}Are\s|\s{{2,}}Number\s|\n|$)",
                 block,
             )
             if pm:
-                out[field] = truncate(
-                    collapse_whitespace(self._refine_value(pm.group("val"), hint)),
-                    500,
-                )
+                raw = collapse_whitespace(self._refine_value(pm.group("val"), hint))
+                out[field] = truncate(self._clip_nit_value(raw), 500)
                 continue
             val = self._find_labeled_value(block, [label], value_hint=hint)
             if val:
@@ -640,6 +666,18 @@ class FieldExtractor:
             ("number_of_jv_member_allowed", re.compile(r"(?i)^number\s+of\s+jv\s+member")),
             ("closing_date_time", re.compile(r"(?i)^(?:tender\s+)?closing\s*date")),
             ("tender_no", re.compile(r"(?i)^tender\s*no\.?$")),
+            ("bidding_type", re.compile(r"(?i)^bidding\s*type$")),
+            ("tender_type", re.compile(r"(?i)^tender\s*type$")),
+            ("bidding_system", re.compile(r"(?i)^bidding\s*system$")),
+            ("tendering_section", re.compile(r"(?i)^tendering\s*section$")),
+            ("contract_type", re.compile(r"(?i)^contract\s*type$")),
+            ("contract_category", re.compile(r"(?i)^contract\s*category$")),
+            ("bidding_style", re.compile(r"(?i)^bidding\s*style$")),
+            ("pre_bid_required", re.compile(r"(?i)^pre-?bid\s+conference\s+required$")),
+            ("jv_allowed", re.compile(r"(?i)^are\s+jv\s+allowed")),
+            ("consortium_allowed", re.compile(r"(?i)^are\s+consortium\s+allowed")),
+            ("status", re.compile(r"(?i)^(?:tender\s+)?status$")),
+            ("reference_no", re.compile(r"(?i)^reference\s*(?:no\.?|number)$")),
         ]
 
         for table in tables:
@@ -659,18 +697,22 @@ class FieldExtractor:
             field = self._nit_field_for_cell(cell.strip(), label_map)
             if not field:
                 continue
-            value = self._next_nonempty_cell(cells, i + 1)
+            value = self._collect_value_span(cells, i + 1, label_map)
             if not value or self._is_placeholder(value):
                 continue
             if field in {"advertised_value", "earnest_money"}:
                 value = self._refine_value(value, "amount")
             elif field == "closing_date_time":
                 value = self._refine_value(value, "datetime")
+            elif field == "tender_no":
+                value = self._clean_tender_no(value) or value
             if field == "name_of_work" and out.get(field):
                 if len(value) > len(out[field] or ""):
                     out[field] = truncate(value, 1000)
             elif not out.get(field):
                 limit = 1000 if field == "name_of_work" else 500
+                if field != "name_of_work":
+                    value = self._clip_nit_value(value) or value
                 out[field] = truncate(value, limit)
 
     @staticmethod
@@ -688,6 +730,34 @@ class FieldExtractor:
             if cells[j].strip():
                 return cells[j].strip()
         return None
+
+    def _collect_value_span(
+        self,
+        cells: list[str],
+        start: int,
+        label_map: list[tuple[str, re.Pattern[str]]],
+    ) -> str | None:
+        """Join cells after `start` until the next recognized label cell.
+
+        Fixes two bugs:
+        - A value that got split into two adjacent cells (e.g. "Open" +
+          leftover wrap of the same value) is now joined back together.
+        - A value cell that pdfplumber left empty (because the real text
+          wrapped into a different row) no longer gets replaced by the
+          NEXT field's own label — we stop instead of grabbing it.
+        """
+        parts: list[str] = []
+        for j in range(start, len(cells)):
+            c = cells[j].strip()
+            if not c:
+                continue
+            if self._nit_field_for_cell(c, label_map) or self._looks_like_label(c):
+                break
+            if re.match(rf"(?i)^(?:{self._NIT_NEXT_LABELS})\b", c):
+                break
+            parts.append(c)
+        joined = " ".join(parts).strip()
+        return joined or None
 
     # ------------------------------------------------------------------
     # Internals
@@ -774,15 +844,10 @@ class FieldExtractor:
 
         # For long "Name of Work" keep more of the line (cut at double-space / next label)
         if value_hint not in {"amount", "date", "datetime"}:
-            # Stop at next known NIT HEADER label on the same line
             value = re.split(
-                r"\s{2,}|\t|\|(?=\s)|(?=\b(?:Tender No|Closing Date|Advertised Value|"
-                r"Earnest Money|Contract Type|Contract Category|Bidding Start|"
-                r"Are JV|Are Consortium|Tender Doc|Validity of Offer|"
-                r"Tendering Section|Bidding Style|Bidding Unit)\b)",
+                rf"(?i)\s{{2,}}|\t|\|(?=\s)|\s+(?=(?:{self._NIT_NEXT_LABELS})\b)",
                 value,
                 maxsplit=1,
-                flags=re.I,
             )[0].strip()
         else:
             value = re.split(r"\s{2,}|\t|\|", value)[0].strip()
@@ -799,13 +864,29 @@ class FieldExtractor:
             )
             if m:
                 return m.group(0).strip()
-            return value
+            return ""
         if value_hint == "days":
             m = re.search(r"\b(\d{1,4})\b", value)
             if m:
                 return m.group(1)
             return value
         return value
+
+    def _clip_nit_value(self, value: str | None) -> str | None:
+        """Stop a NIT field at the next header label on the same line."""
+        if not value:
+            return value
+        clipped = re.split(
+            rf"(?i)\s+(?=(?:{self._NIT_NEXT_LABELS})\b)",
+            str(value),
+            maxsplit=1,
+        )[0].strip()
+        clipped = re.sub(
+            r"(?i)^(?:to\s+bid|for\s+bids|allowed|date)\s+",
+            "",
+            clipped,
+        ).strip()
+        return clipped or None
 
     @staticmethod
     def _is_placeholder(value: str) -> bool:
@@ -814,7 +895,22 @@ class FieldExtractor:
 
     @staticmethod
     def _looks_like_label(value: str) -> bool:
-        return bool(re.match(r"^[A-Za-z ]{3,40}:?\s*$", value)) and ":" not in value[1:]
+        """True only when the captured text is itself a NIT label, not a value."""
+        v = (value or "").strip().rstrip(":").lower()
+        if not v:
+            return True
+        if v in {"yes", "no", "open", "closed", "normal", "normal tender"}:
+            return False
+        return bool(
+            re.fullmatch(
+                r"(?:bidding\s*type|tender\s*type|bidding\s*system|tendering\s*section|"
+                r"contract\s*type|contract\s*category|advertised\s*value|"
+                r"earnest\s*money|period\s+of\s+completion|name\s+of\s+work|"
+                r"pre-?bid\s+conference(?:\s+required)?|validity\s+of\s+offer|"
+                r"bidding\s*style|bidding\s*unit|expenditure\s*type)",
+                v,
+            )
+        )
 
     @staticmethod
     def _infer_currency(text: str) -> str | None:

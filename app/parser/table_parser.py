@@ -1,8 +1,9 @@
 """
 Table extraction and multi-page merge.
 
-Detects tables via pdfplumber, normalizes headers using PRODUCT_HEADER_ALIASES,
-and stitches continuation tables across pages when column signatures match.
+Detects tables via pdfplumber + PyMuPDF, normalizes headers using
+PRODUCT_HEADER_ALIASES, and stitches continuation tables across pages
+when column signatures match.
 """
 
 from __future__ import annotations
@@ -14,12 +15,51 @@ from pathlib import Path
 from typing import Any
 
 import pdfplumber
+import pymupdf
 
 from app.config import Settings, get_settings
 from app.utils.patterns import PRODUCT_HEADER_ALIASES
 from app.utils.text_utils import collapse_whitespace
 
 logger = logging.getLogger(__name__)
+
+# Short tokens that must not steal a more specific neighbouring column
+# (e.g. "unit" must not claim "Unit Rate"; "qty" must not claim "Qty Unit").
+_WEAK_HEADER_ALIASES = {
+    "sl",
+    "sn",
+    "sr",
+    "#",
+    "no",
+    "qty",
+    "amt",
+    "code",
+    "unit",
+    "rate",
+    "nos",
+    "product",
+}
+
+# pdfplumber table_settings tried when the default line-based extract is weak.
+_FALLBACK_TABLE_SETTINGS: list[dict[str, Any]] = [
+    {
+        "vertical_strategy": "lines",
+        "horizontal_strategy": "text",
+        "snap_tolerance": 4,
+        "intersection_tolerance": 5,
+        "text_y_tolerance": 3,
+    },
+    {
+        "vertical_strategy": "text",
+        "horizontal_strategy": "text",
+        "min_words_vertical": 2,
+        "min_words_horizontal": 1,
+        "snap_tolerance": 3,
+        "intersection_tolerance": 5,
+        "text_x_tolerance": 2,
+        "text_y_tolerance": 3,
+    },
+]
 
 
 @dataclass
@@ -48,47 +88,194 @@ class TableParser:
         if password:
             open_kwargs["password"] = password
 
+        fitz_by_page, fitz_page_count = self._pymupdf_tables(path, password)
+
         try:
             pdf_ctx = pdfplumber.open(path, **open_kwargs)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Table extraction failed to open PDF: %s", exc)
-            return []
+            logger.warning("Table extraction failed to open PDF with pdfplumber: %s", exc)
+            pdf_ctx = None
 
-        with pdf_ctx as pdf:
-            # A BOQ/schedule that spans many pages doesn't always repeat its
-            # header row on continuation pages — pdfplumber then hands back a
-            # per-page table whose first row is really a mid-schedule data
-            # row. Left alone, that row gets sacrificed as a fake header
-            # (losing one real item every time) and the rest of the page is
-            # never recognized as product data. Track the last confirmed
-            # product table's header/column-mapping so a same-width table
-            # whose "header" doesn't actually look like one can reuse it.
-            last_product_headers: list[str] | None = None
-            last_product_mapped: dict[str, int] | None = None
-            for i, page in enumerate(pdf.pages[: self.settings.max_pages]):
-                try:
-                    raw_tables = page.extract_tables() or []
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Table extraction failed on page %d: %s", i + 1, exc)
-                    continue
-                for raw in raw_tables:
-                    try:
-                        parsed = self._normalize_table(
-                            raw,
-                            page_number=i + 1,
-                            fallback_headers=last_product_headers,
-                            fallback_mapped=last_product_mapped,
+        last_product_headers: list[str] | None = None
+        last_product_mapped: dict[str, int] | None = None
+
+        try:
+            plumber_pages = list(pdf_ctx.pages[: self.settings.max_pages]) if pdf_ctx else []
+            n_pages = max(len(plumber_pages), fitz_page_count)
+            for i in range(n_pages):
+                page_number = i + 1
+                raw_candidates: list[list[list[Any]]] = list(fitz_by_page.get(page_number, []))
+                page = plumber_pages[i] if i < len(plumber_pages) else None
+                if page is not None:
+                    raw_candidates.extend(self._plumber_page_tables(page, fallback=False))
+
+                parsed_list = self._parse_raw_list(
+                    raw_candidates,
+                    page_number,
+                    last_product_headers,
+                    last_product_mapped,
+                )
+                if self._page_extraction_weak(parsed_list) and page is not None:
+                    extra = self._plumber_page_tables(page, fallback=True)
+                    parsed_list.extend(
+                        self._parse_raw_list(
+                            extra,
+                            page_number,
+                            last_product_headers,
+                            last_product_mapped,
                         )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("Table normalization failed on page %d: %s", i + 1, exc)
-                        continue
-                    if parsed and len(parsed.rows) >= 1:
-                        tables.append(parsed)
-                        if parsed.is_product_table:
-                            last_product_headers = parsed.headers
-                            last_product_mapped = parsed.mapped_headers
+                    )
+
+                for parsed in self._select_page_tables(parsed_list):
+                    tables.append(parsed)
+                    if parsed.is_product_table:
+                        last_product_headers = parsed.headers
+                        last_product_mapped = parsed.mapped_headers
+        finally:
+            if pdf_ctx is not None:
+                pdf_ctx.close()
 
         return self.merge_multipage_tables(tables)
+
+    def _plumber_page_tables(
+        self, page: Any, *, fallback: bool
+    ) -> list[list[list[Any]]]:
+        raw_tables: list[list[list[Any]]] = []
+        settings_list: list[dict[str, Any] | None]
+        if fallback:
+            settings_list = list(_FALLBACK_TABLE_SETTINGS)
+        else:
+            settings_list = [None]
+        for settings in settings_list:
+            try:
+                if settings:
+                    found = page.extract_tables(table_settings=settings) or []
+                else:
+                    found = page.extract_tables() or []
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Table extraction failed on a page: %s", exc)
+                continue
+            for raw in found:
+                if self._raw_table_plausible(raw):
+                    raw_tables.append(raw)
+        return raw_tables
+
+    def _pymupdf_tables(
+        self, path: Path, password: str | None
+    ) -> tuple[dict[int, list[list[list[Any]]]], int]:
+        out: dict[int, list[list[list[Any]]]] = {}
+        try:
+            doc = pymupdf.open(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PyMuPDF table extraction failed to open PDF: %s", exc)
+            return out, 0
+        try:
+            if doc.is_encrypted and not doc.authenticate(password or ""):
+                return out, 0
+            max_pages = min(doc.page_count, self.settings.max_pages)
+            for i in range(max_pages):
+                try:
+                    finder = doc[i].find_tables()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("PyMuPDF find_tables failed on page %d: %s", i + 1, exc)
+                    continue
+                found: list[list[list[Any]]] = []
+                for tab in getattr(finder, "tables", None) or []:
+                    try:
+                        extracted = tab.extract()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if self._raw_table_plausible(extracted):
+                        found.append(extracted)
+                if found:
+                    out[i + 1] = found
+            return out, max_pages
+        finally:
+            doc.close()
+
+    def _parse_raw_list(
+        self,
+        raw_tables: list[list[list[Any]]],
+        page_number: int,
+        fallback_headers: list[str] | None,
+        fallback_mapped: dict[str, int] | None,
+    ) -> list[ExtractedTable]:
+        parsed: list[ExtractedTable] = []
+        for raw in raw_tables:
+            try:
+                table = self._normalize_table(
+                    raw,
+                    page_number=page_number,
+                    fallback_headers=fallback_headers,
+                    fallback_mapped=fallback_mapped,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Table normalization failed on page %d: %s", page_number, exc)
+                continue
+            if table and len(table.rows) >= 1:
+                parsed.append(table)
+        return parsed
+
+    @staticmethod
+    def _raw_table_plausible(raw: list[list[Any]] | None) -> bool:
+        if not raw or len(raw) < 1:
+            return False
+        cols = max((len(r) for r in raw if r is not None), default=0)
+        return 1 <= cols <= 25
+
+    def _page_extraction_weak(self, tables: list[ExtractedTable]) -> bool:
+        product = [t for t in tables if t.is_product_table]
+        if not product:
+            return True
+        best = max(product, key=self._table_quality)
+        if len(best.mapped_headers) < 3:
+            return True
+        return not self._numeric_fields_sane(best.mapped_headers, best.rows)
+
+    def _select_page_tables(self, parsed_list: list[ExtractedTable]) -> list[ExtractedTable]:
+        if not parsed_list:
+            return []
+        unique: list[ExtractedTable] = []
+        for table in sorted(parsed_list, key=self._table_quality, reverse=True):
+            if any(self._is_duplicate_table(table, kept) for kept in unique):
+                continue
+            unique.append(table)
+        return unique
+
+    def _table_quality(self, table: ExtractedTable) -> tuple:
+        filled = sum(1 for row in table.rows for cell in row if (cell or "").strip())
+        sane = 1 if self._numeric_fields_sane(table.mapped_headers, table.rows) else 0
+        return (
+            sane,
+            1 if table.is_product_table else 0,
+            len(table.mapped_headers),
+            len(table.rows),
+            filled,
+        )
+
+    @staticmethod
+    def _is_duplicate_table(a: ExtractedTable, b: ExtractedTable) -> bool:
+        if a.is_product_table and b.is_product_table:
+            if set(a.mapped_headers.keys()) == set(b.mapped_headers.keys()):
+                return True
+        return TableParser._row_text_overlap(a, b) and abs(len(a.headers) - len(b.headers)) <= 1
+
+    @staticmethod
+    def _row_text_overlap(a: ExtractedTable, b: ExtractedTable) -> bool:
+        def cells(table: ExtractedTable) -> set[str]:
+            values: set[str] = set()
+            for row in table.rows[:6]:
+                for cell in row:
+                    text = (cell or "").strip().lower()[:60]
+                    if len(text) >= 4:
+                        values.add(text)
+            return values
+
+        left, right = cells(a), cells(b)
+        if not left or not right:
+            return False
+        overlap = len(left & right)
+        return overlap >= min(3, min(len(left), len(right)))
 
     def _normalize_table(
         self,
@@ -110,6 +297,8 @@ class TableParser:
         cleaned = [r for r in cleaned if any(c.strip() for c in r)]
         if len(cleaned) < self.settings.table_min_rows:
             return None
+
+        cleaned = self._merge_wrapped_header_rows(cleaned)
 
         header_row = cleaned[0]
         schedule_caption: str | None = None
@@ -171,7 +360,14 @@ class TableParser:
             # instead of losing it when the caption rows were consumed here.
             data_rows = [[schedule_caption] + [""] * (len(header_row) - 1)] + data_rows
 
+        headers, mapped, data_rows = self._align_table_width(headers, mapped, data_rows)
+
         is_product = self._looks_like_product_table(mapped, headers)
+        if is_product and not self._numeric_fields_sane(mapped, data_rows):
+            # Headers matched, but qty/rate/amount cells are clearly shifted.
+            # Keep the table for NIT key/value scraping, but do not treat it
+            # as a BOQ — the text parser is safer than mis-aligned columns.
+            is_product = False
 
         return ExtractedTable(
             page_number=page_number,
@@ -180,6 +376,129 @@ class TableParser:
             mapped_headers=mapped,
             is_product_table=is_product,
         )
+
+    def _merge_wrapped_header_rows(self, cleaned: list[list[str]]) -> list[list[str]]:
+        """
+        IREPS / GeM headers often wrap onto a second line:
+
+            S.No. | Item | Item Qty | ... | Bidding
+                  | Code |          |     | Unit
+
+        Merge those continuation tokens into the header before we decide
+        what the columns are. A real data row is never merged.
+        """
+        if len(cleaned) < 2:
+            return cleaned
+        rows = [list(r) for r in cleaned]
+        header = rows[0]
+        consumed = 0
+        for i in range(1, min(3, len(rows))):
+            nxt = rows[i]
+            if not self._is_header_continuation(header, nxt):
+                break
+            header = self._combine_header_rows(header, nxt)
+            consumed = i
+        if consumed:
+            return [header] + rows[consumed + 1 :]
+        return rows
+
+    def _is_header_continuation(self, header_row: list[str], next_row: list[str]) -> bool:
+        if not header_row or not next_row:
+            return False
+        if not (
+            self._looks_like_header_row(header_row)
+            or self._looks_like_partial_header(header_row)
+        ):
+            return False
+        if self._looks_like_data_row(next_row):
+            return False
+        filled = [c.strip() for c in next_row if c.strip()]
+        if not filled:
+            return False
+        if any(len(c) > 40 for c in filled):
+            return False
+        if all(len(c) <= 24 and not re.search(r"\d{2,}", c) for c in filled):
+            merged = self._combine_header_rows(header_row, next_row)
+            if len(self.map_headers(merged)) > len(self.map_headers(header_row)):
+                return True
+            return any(
+                re.fullmatch(
+                    r"(?i)code|unit|no\.?|particulars?|of\s+item|description|qty|rate|amount",
+                    c,
+                )
+                for c in filled
+            )
+        if self._looks_like_header_row(next_row):
+            return True
+        return False
+
+    @staticmethod
+    def _looks_like_partial_header(row: list[str]) -> bool:
+        cells = [c.strip() for c in row if c.strip()]
+        if len(cells) < 2:
+            return False
+        headerish = sum(
+            1
+            for c in cells
+            if re.search(
+                r"(?i)\b(?:s\.?\s*no|item|quantity|qty|unit|rate|amount|desc|code|escl)\b",
+                c,
+            )
+        )
+        return headerish >= 2 and not TableParser._looks_like_data_row(row)
+
+    @staticmethod
+    def _combine_header_rows(a: list[str], b: list[str]) -> list[str]:
+        n = max(len(a), len(b))
+        left = list(a) + [""] * (n - len(a))
+        right = list(b) + [""] * (n - len(b))
+        merged: list[str] = []
+        for x, y in zip(left, right):
+            x, y = x.strip(), y.strip()
+            if not y or y.lower() in x.lower():
+                merged.append(x)
+            elif not x:
+                merged.append(y)
+            elif x.lower() in y.lower():
+                merged.append(y)
+            else:
+                merged.append(f"{x} {y}".strip())
+        return merged
+
+    def _align_table_width(
+        self,
+        headers: list[str],
+        mapped: dict[str, int],
+        data_rows: list[list[str]],
+    ) -> tuple[list[str], dict[str, int], list[list[str]]]:
+        width = len(headers)
+        if data_rows:
+            width = max(width, max(len(r) for r in data_rows))
+        if width > len(headers):
+            headers = headers + [f"col_{idx}" for idx in range(len(headers), width)]
+            mapped = self.map_headers(headers)
+        data_rows = self._fit_rows(data_rows, len(headers), mapped)
+        return headers, mapped, data_rows
+
+    @staticmethod
+    def _fit_rows(
+        rows: list[list[str]], n: int, mapped: dict[str, int]
+    ) -> list[list[str]]:
+        desc_idx = mapped.get("description")
+        fitted: list[list[str]] = []
+        for row in rows:
+            cells = list(row)
+            if len(cells) < n:
+                cells.extend([""] * (n - len(cells)))
+            elif len(cells) > n:
+                extras = [c for c in cells[n:] if c.strip()]
+                cells = cells[:n]
+                if extras:
+                    blob = " ".join(extras)
+                    target = desc_idx if desc_idx is not None and desc_idx < n else n - 1
+                    cells[target] = (cells[target] + " " + blob).strip()
+            fitted.append(cells)
+        return fitted
 
     @staticmethod
     def _looks_like_header_row(row: list[str]) -> bool:
@@ -198,6 +517,18 @@ class TableParser:
             if re.fullmatch(r"[\d,]+\.?\d*\s*%?", c) or c.strip().lower() == "at par"
         )
         return numeric_like < max(1, len(cells) // 2)
+
+    @staticmethod
+    def _looks_like_data_row(row: list[str]) -> bool:
+        cells = [c.strip() for c in row if c.strip()]
+        if not cells:
+            return False
+        numeric_like = sum(
+            1
+            for c in cells
+            if re.fullmatch(r"[\d,]+\.?\d*\s*%?", c) or c.strip().lower() == "at par"
+        )
+        return numeric_like >= max(1, len(cells) // 2)
 
     @staticmethod
     def _looks_like_stray_noise_row(row: list[str]) -> bool:
@@ -232,27 +563,98 @@ class TableParser:
         return not rest_populated or len(first) > 15 or "\n" in first
 
     @staticmethod
+    def _norm_header_label(text: str) -> str:
+        norm = re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+        return re.sub(r"\s+", " ", norm)
+
+    @staticmethod
     def map_headers(headers: list[str]) -> dict[str, int]:
-        """Map table headers to canonical product fields."""
-        mapped: dict[str, int] = {}
+        """Map table headers to canonical product fields (longest unique match)."""
+        candidates: list[tuple[int, int, int, str]] = []
         for idx, header in enumerate(headers):
-            norm = re.sub(r"[^a-z0-9.#]+", " ", header.lower()).strip()
-            norm = re.sub(r"\s+", " ", norm)
+            norm = TableParser._norm_header_label(header)
+            if not norm:
+                continue
+            tokens = norm.split()
             for canonical, aliases in PRODUCT_HEADER_ALIASES.items():
-                if canonical in mapped:
-                    continue
+                best_score = 0
+                best_alias_len = 0
                 for alias in aliases:
-                    if norm == alias or norm.startswith(alias + " ") or alias in norm.split():
-                        mapped[canonical] = idx
-                        break
-                if canonical in mapped:
-                    break
-                # Fuzzy contains
-                for alias in aliases:
-                    if alias in norm:
-                        mapped[canonical] = idx
-                        break
+                    alias_norm = TableParser._norm_header_label(alias)
+                    if not alias_norm:
+                        continue
+                    score = TableParser._alias_score(norm, tokens, alias_norm)
+                    if score > best_score:
+                        best_score = score
+                        best_alias_len = len(alias_norm)
+                if best_score > 0:
+                    candidates.append((best_score, best_alias_len, idx, canonical))
+
+        candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        mapped: dict[str, int] = {}
+        used_idx: set[int] = set()
+        used_canonical: set[str] = set()
+        for score, _alias_len, idx, canonical in candidates:
+            if score < 50:
+                continue
+            if idx in used_idx or canonical in used_canonical:
+                continue
+            mapped[canonical] = idx
+            used_idx.add(idx)
+            used_canonical.add(canonical)
         return mapped
+
+    @staticmethod
+    def _alias_score(norm: str, tokens: list[str], alias: str) -> int:
+        alias_tokens = alias.split()
+        weak = alias in _WEAK_HEADER_ALIASES
+        if norm == alias:
+            return 100 + len(alias)
+        if norm.startswith(alias + " "):
+            base = 80 + len(alias)
+            return min(base, 55) if weak else base
+        if TableParser._consecutive_tokens(tokens, alias_tokens):
+            base = 70 + len(alias)
+            if weak and alias_tokens != tokens:
+                return 45
+            return base
+        if weak:
+            return 0
+        if alias in norm:
+            return 40 + len(alias)
+        return 0
+
+    @staticmethod
+    def _consecutive_tokens(tokens: list[str], alias_tokens: list[str]) -> bool:
+        if not alias_tokens or len(alias_tokens) > len(tokens):
+            return False
+        n = len(alias_tokens)
+        return any(tokens[i : i + n] == alias_tokens for i in range(len(tokens) - n + 1))
+
+    @staticmethod
+    def _numeric_fields_sane(mapped: dict[str, int], rows: list[list[str]]) -> bool:
+        data = [r for r in rows if TableParser._looks_like_data_row(r)]
+        if len(data) < 1:
+            return True
+        for field in ("item_qty", "unit_rate", "amount", "basic_value"):
+            idx = mapped.get(field)
+            if idx is None:
+                continue
+            values = [
+                (row[idx] if idx < len(row) else "")
+                for row in data
+            ]
+            nonempty = [
+                v.strip()
+                for v in values
+                if v and v.strip() and not re.match(r"(?i)^description\s*[:\-–]", v.strip())
+            ]
+            if len(nonempty) < 1:
+                continue
+            numeric = sum(1 for v in nonempty if re.search(r"\d", v))
+            if numeric / len(nonempty) < 0.5:
+                return False
+        return True
 
     @staticmethod
     def _looks_like_product_table(mapped: dict[str, int], headers: list[str]) -> bool:

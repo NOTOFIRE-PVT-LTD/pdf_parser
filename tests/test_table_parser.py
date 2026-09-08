@@ -126,3 +126,89 @@ def test_looks_like_header_row():
         ["13", "c", "1.00", "Station", "62075.00", "62075.00", "AT Par", "62075.00", "Above/Below/Par"]
     )
     assert not tp._looks_like_header_row(["Item- 1", "SOR items", "", "", "", "", ""])
+
+
+def test_map_headers_does_not_swap_qty_unit_and_unit_rate():
+    """
+    Short aliases like "unit" / "qty" used to claim the wrong column:
+    "Unit Rate" became qty_unit and "Qty Unit" became item_qty, so Excel
+    rows had rates in the unit column and quantities in the rate column.
+    """
+    mapped = TableParser.map_headers(
+        [
+            "S.No.",
+            "Item Code",
+            "Item Qty",
+            "Qty Unit",
+            "Unit Rate",
+            "Basic Value",
+            "Escl.(%)",
+            "Amount",
+            "Bidding Unit",
+        ]
+    )
+    assert mapped["s_no"] == 0
+    assert mapped["item_code"] == 1
+    assert mapped["item_qty"] == 2
+    assert mapped["qty_unit"] == 3
+    assert mapped["unit_rate"] == 4
+    assert mapped["basic_value"] == 5
+    assert mapped["escalation"] == 6
+    assert mapped["amount"] == 7
+    assert mapped["bidding_unit"] == 8
+
+    swapped = TableParser.map_headers(
+        ["Description of Item", "Unit Rate", "Qty", "Amount"]
+    )
+    assert swapped["description"] == 0
+    assert swapped["unit_rate"] == 1
+    assert swapped["item_qty"] == 2
+    assert swapped["amount"] == 3
+    assert "qty_unit" not in swapped
+
+    generic = TableParser.map_headers(
+        ["SN", "Description", "Unit", "Mumbai", "Pune", "Qty"]
+    )
+    assert generic["s_no"] == 0
+    assert generic["description"] == 1
+    assert generic["qty_unit"] == 2
+    assert generic["item_qty"] == 5
+
+
+def test_normalize_table_merges_wrapped_ireps_headers():
+    """
+    IREPS schedule headers wrap onto a second line ("Item" + "Code",
+    "Bidding" + "Unit"). Those tokens must be merged into the header, not
+    treated as the first data row — otherwise every column shifts.
+    """
+    tp = TableParser()
+    raw = [
+        ["S.No.", "Item", "Item Qty", "Qty Unit", "Unit Rate", "Basic Value", "Escl.(%)", "Amount", "Bidding"],
+        ["", "Code", "", "", "", "", "", "", "Unit"],
+        ["1", "1", "360.00", "Month", "70890.38", "25520536.80", "AT Par", "25520536.80", "Rs."],
+        ["", "Description:- Site Engineer (S&T)", "", "", "", "", "", "", ""],
+    ]
+    table = tp._normalize_table(raw, page_number=1)
+    assert table is not None
+    assert table.mapped_headers.get("item_code") == 1
+    assert table.mapped_headers.get("unit_rate") == 4
+    assert table.mapped_headers.get("bidding_unit") == 8
+    assert table.rows[0][0] == "1"
+    assert table.rows[0][2] == "360.00"
+    assert table.rows[0][4] == "70890.38"
+    assert table.is_product_table
+
+
+def test_normalize_table_pads_short_rows_so_columns_stay_aligned():
+    tp = TableParser()
+    raw = [
+        ["S.No.", "Item Code", "Item Qty", "Qty Unit", "Unit Rate"],
+        ["1", "A", "10.00"],
+    ]
+    table = tp._normalize_table(raw, page_number=1)
+    assert table is not None
+    assert len(table.rows[0]) == 5
+    assert table.rows[0][0] == "1"
+    assert table.rows[0][2] == "10.00"
+    assert table.rows[0][3] == ""
+    assert table.rows[0][4] == ""

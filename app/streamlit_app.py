@@ -734,22 +734,64 @@ def _refresh_assistant(chat: dict, idx: int) -> None:
     st.rerun()
 
 
+def _format_upload_time(iso: str | None) -> str:
+    """Human-readable local timestamp for an uploaded PDF."""
+    if not iso:
+        return ""
+    raw = str(iso).strip()
+    if not raw:
+        return ""
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return raw
+        hour = dt.strftime("%I").lstrip("0") or "12"
+        return f"{dt.day} {dt.strftime('%b %Y')}, {hour}:{dt.strftime('%M %p')}"
+
+
+def _is_pdf_upload(msg: dict) -> bool:
+    return bool(
+        msg.get("role") == "user"
+        and (msg.get("file_paths") or msg.get("files"))
+    )
+
+
+def _pdf_upload_spans(messages: list) -> list[tuple[int, int]]:
+    """(start, end) index spans for each PDF-upload turn and its follow-up replies."""
+    starts = [i for i, m in enumerate(messages) if _is_pdf_upload(m)]
+    if not starts:
+        return []
+    spans: list[tuple[int, int]] = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(messages)
+        spans.append((start, end))
+    return spans
+
+
 def _render_hover_actions(chat: dict, idx: int, role: str, content: str) -> None:
-    """Small muted Edit/Copy — user messages only, visible on hover."""
+    """Edit and Copy on one right-aligned row (same height)."""
     if role != "user":
         return
     cid = chat["id"]
-    spacer, edit_col, copy_col = st.columns([12, 1, 1], gap="small")
-    with edit_col:
-        _html('<span class="nf-action-hit"></span>')
-        if st.button("Edit", key=f"edit_{cid}_{idx}", help="Edit message"):
+    with st.container(
+        horizontal=True,
+        gap="small",
+        horizontal_alignment="right",
+        vertical_alignment="center",
+        wrap=False,
+        key=f"nf_actions_{cid}_{idx}",
+    ):
+        if st.button("Edit", key=f"edit_{cid}_{idx}", help="Edit message", width="content"):
             _start_edit_user(chat, idx)
-    with copy_col:
-        if st.button("Copy", key=f"copy_u_{cid}_{idx}", help="Copy message"):
+        if st.button("Copy", key=f"copy_u_{cid}_{idx}", help="Copy message", width="content"):
             _copy_to_clipboard(content)
 
 
-def _render_user_bubble(content: str, files: list[str] | None = None) -> None:
+def _render_user_bubble(
+    content: str,
+    files: list[str] | None = None,
+    uploaded_at: str | None = None,
+) -> None:
     chips = ""
     if files:
         chips = (
@@ -759,12 +801,17 @@ def _render_user_bubble(content: str, files: list[str] | None = None) -> None:
             )
             + "</div>"
         )
+    when = _format_upload_time(uploaded_at)
+    time_html = (
+        f'<span class="nf-time">{html.escape(when)}</span>' if when else ""
+    )
     _html(
         f"""
         <div class="nf-row nf-row-user">
           <div class="nf-bubble nf-bubble-user">
             <div class="nf-bubble-text">{_md_to_html(content)}</div>
             {chips}
+            {time_html}
           </div>
         </div>
         """
@@ -777,7 +824,7 @@ def _render_message(msg: dict, chat: dict, idx: int) -> None:
     files = msg.get("files") or []
 
     if role == "user":
-        _render_user_bubble(content, files)
+        _render_user_bubble(content, files, msg.get("uploaded_at"))
         _render_hover_actions(chat, idx, "user", content)
         return
 
@@ -813,12 +860,21 @@ def _render_message(msg: dict, chat: dict, idx: int) -> None:
         ]
         if len(results) == 1:
             stem = Path(results[0].meta.filename if results[0].meta else "tender").stem
+            csv_data = exporter.to_csv_bytes(results[0], which="products")
+            xlsx_data = exporter.to_excel_bytes(results[0])
             st.download_button(
                 "Download CSV",
-                data=exporter.to_csv_bytes(results[0], which="products"),
+                data=csv_data,
                 file_name=f"{stem}.csv",
                 mime="text/csv",
                 key=f"dl_csv_{chat['id']}_{idx}",
+            )
+            st.download_button(
+                "Download Excel",
+                data=xlsx_data,
+                file_name=f"{stem}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_xlsx_{chat['id']}_{idx}",
             )
         elif results:
             st.download_button(
@@ -827,6 +883,13 @@ def _render_message(msg: dict, chat: dict, idx: int) -> None:
                 file_name="tenders_export.csv",
                 mime="text/csv",
                 key=f"dl_csv_{chat['id']}_{idx}",
+            )
+            st.download_button(
+                "Download Excel",
+                data=exporter.to_combined_excel_bytes(results),
+                file_name="tenders_export.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_xlsx_{chat['id']}_{idx}",
             )
 
 
@@ -970,6 +1033,7 @@ def _enqueue_turn(
         "prompt_text": prompt_text,
         "files": names or None,
         "file_paths": saved or None,
+        "uploaded_at": datetime.now().isoformat(timespec="seconds") if has_files else None,
     })
     st.session_state.pop("_edit_draft", None)
     st.session_state["_pending_turn"] = {
@@ -980,6 +1044,37 @@ def _enqueue_turn(
     }
     _persist()
     st.rerun()
+
+
+def _render_chat_history(chat: dict, messages: list) -> None:
+    """Show the latest PDF upload fully; tuck earlier uploads behind More."""
+    if not messages:
+        return
+    spans = _pdf_upload_spans(messages)
+    if len(spans) < 2:
+        for idx, msg in enumerate(messages):
+            _render_message(msg, chat, idx)
+        return
+
+    first_pdf = spans[0][0]
+    for idx in range(first_pdf):
+        _render_message(messages[idx], chat, idx)
+
+    latest_start = spans[-1][0]
+    for start, end in spans[:-1]:
+        msg = messages[start]
+        names = msg.get("files") or []
+        label_name = names[0] if names else "PDF"
+        when = _format_upload_time(msg.get("uploaded_at"))
+        extra = f" · {when}" if when else ""
+        n = len(names)
+        title = f"More · {label_name}{extra}" if n <= 1 else f"More · {n} PDFs{extra}"
+        with st.expander(title, expanded=False):
+            for idx in range(start, end):
+                _render_message(messages[idx], chat, idx)
+
+    for idx in range(latest_start, len(messages)):
+        _render_message(messages[idx], chat, idx)
 
 
 def _finish_pending_turn(chat: dict, pending: dict) -> None:
@@ -995,8 +1090,7 @@ def _finish_pending_turn(chat: dict, pending: dict) -> None:
         disabled=True,
     )
 
-    for idx, msg in enumerate(chat.get("messages") or []):
-        _render_message(msg, chat, idx)
+    _render_chat_history(chat, chat.get("messages") or [])
 
     status = st.empty()
     text = pending.get("text") or ""
@@ -1127,8 +1221,7 @@ def main() -> None:
             key=f"composer_{chat['id']}",
         )
 
-    for idx, msg in enumerate(messages):
-        _render_message(msg, chat, idx)
+    _render_chat_history(chat, messages)
 
     if not editing and prompt is not None:
         if isinstance(prompt, str):

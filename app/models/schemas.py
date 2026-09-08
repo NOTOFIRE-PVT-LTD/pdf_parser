@@ -133,6 +133,10 @@ class ProductItem(BaseModel):
     schedule: str | None = None
     page_numbers: list[int] = Field(default_factory=list)
 
+    # Annexure child rows (Item N Breakup) point at the parent schedule serial.
+    # JSON includes this for parent-child loads; portal Excel/CSV columns are unchanged.
+    parent_s_no: str | None = None
+
     # Internal-only: absolute character offset of this item in the extracted
     # document text, used solely to order rows that have no S.No. by their
     # true document position instead of by which extraction pass found them.

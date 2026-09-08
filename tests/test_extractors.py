@@ -5,6 +5,8 @@ Run: pytest -q
 
 from __future__ import annotations
 
+import re
+
 from app.extractor.clause_extractor import ClauseExtractor
 from app.extractor.field_extractor import FieldExtractor
 from app.extractor.product_extractor import ProductExtractor
@@ -152,6 +154,19 @@ Number of JV Member Allowed 3
     assert info.earnest_money and "2017600" in info.earnest_money.replace(",", "")
     assert info.period_of_completion and "24" in info.period_of_completion
     assert info.number_of_jv_member_allowed == "3"
+    assert info.bidding_type == "Normal Tender"
+    assert info.tender_type == "Open"
+    assert info.contract_type == "Works - General"
+    assert info.contract_category == "Expenditure"
+    assert info.tendering_section == "DY.CSTE/W"
+    assert info.pre_bid_required == "No"
+    assert info.jv_allowed == "Yes"
+    assert info.consortium_allowed == "No"
+    assert info.consortium_members_allowed == "0"
+    assert info.ranking_order == "Lowest to Highest"
+    assert info.reference_no == "DYCSTE_Works_PSSA_02R"
+    assert info.status is None  # IREPS NIT PDFs usually omit tender status
+    assert info.pdf_url is None  # no document URL in the NIT text
 
 
 def test_no_duplicate_products_with_different_sno():
@@ -446,6 +461,78 @@ def test_products_from_schedule_table():
     assert products[0].description and "Site Engineer" in products[0].description
 
 
+def test_priced_row_fragment_not_glued_onto_previous_description():
+    """A wrap of the NEXT item's AT Par / amounts line must not append to the previous description."""
+    sample = """
+Schedule () A-SOR items - Loop Lines
+A 3.00 Numbers 15727.00 47181.00 AT Par 47181.00
+Description:- Supply of colour light signal post 3.6 mtrs. and ladder
+3
+11655.00 AT Par 11655.00
+A 5.00 Numbers 2331.00 11655.00 AT Par 11655.00
+Description:- Fixing of Calling-on Signal unit on signal post
+5
+"""
+    products = ProductExtractor().extract(sample)
+    by_sno = {p.s_no: p for p in products if ProductExtractor._schedule_letter(p.schedule) == "a"}
+    assert "3" in by_sno and "5" in by_sno
+    desc3 = by_sno["3"].description or ""
+    assert "colour light signal" in desc3
+    assert "AT Par" not in desc3
+    assert "11655.00" not in desc3
+    assert "Calling-on" in (by_sno["5"].description or "")
+
+    headers = [
+        "S.No.",
+        "Item Code",
+        "Item Qty",
+        "Qty Unit",
+        "Unit Rate",
+        "Basic Value",
+        "Escl.(%)",
+        "Amount",
+        "Bidding Unit",
+    ]
+    mapped = TableParser.map_headers(headers)
+    table = ExtractedTable(
+        page_number=1,
+        headers=headers,
+        rows=[
+            ["1", "A", "3.00", "Numbers", "15727.00", "47181.00", "AT Par", "47181.00", ""],
+            ["Description:- Supply of colour light signal post 3.6 mtrs."],
+            ["", "", "", "", "", "", "AT Par", "11655.00", ""],
+            ["2", "A", "5.00", "Numbers", "2331.00", "11655.00", "AT Par", "11655.00", ""],
+            ["Description:- Fixing of Calling-on Signal unit"],
+        ],
+        mapped_headers=mapped,
+        is_product_table=True,
+    )
+    padded = []
+    for row in table.rows:
+        if len(row) < len(headers):
+            row = row + [""] * (len(headers) - len(row))
+        padded.append(row)
+    table.rows = padded
+    table_items = ProductExtractor()._from_schedule_table(table)
+    first = next(p for p in table_items if p.s_no == "1")
+    assert "colour light signal" in (first.description or "")
+    assert "AT Par" not in (first.description or "")
+    assert "11655.00" not in (first.description or "")
+
+
+def test_nit_value_span_stops_at_next_label():
+    extractor = FieldExtractor()
+    labels = [
+        ("tender_type", re.compile(r"(?i)^tender\s*type$")),
+        ("bidding_system", re.compile(r"(?i)^bidding\s*system$")),
+    ]
+    assert extractor._collect_value_span(
+        ["Tender Type", "Open", "Bidding System", "Single Packet System"],
+        1,
+        labels,
+    ) == "Open"
+
+
 def test_products_from_generic_boq_table_without_pricing_columns():
     """
     Real-world equipment BOQs often have no Item Code / Rate / Amount columns at
@@ -503,3 +590,430 @@ def test_export_json_excel_csv():
     assert "tender_no" in data
     assert len(exporter.to_excel_bytes(result)) > 100
     assert len(exporter.to_csv_bytes(result, which="summary")) > 10
+
+
+def test_schedule_title_and_item_code_normalization():
+    """
+    IREPS captions often look like "Schedule () 01-..." or
+    "Schedule Schedule 02-...". Item Code is frequently omitted and the
+    serial is the code — export should fill itemCode from S.No. in that case.
+    """
+    assert (
+        ProductExtractor._clean_schedule_title("Schedule () 01-Supply Portion-I")
+        == "Schedule 01-Supply Portion-I"
+    )
+    assert (
+        ProductExtractor._clean_schedule_title("Schedule Schedule 02-Supply Portion-II")
+        == "Schedule 02-Supply Portion-II"
+    )
+    assert (
+        ProductExtractor._clean_schedule_title("Schedule () A-Key Personnels 17395123.20")
+        == "Schedule A-Key Personnels"
+    )
+    assert (
+        ProductExtractor._clean_schedule_title(
+            "Schedule A-SOR items - Loop Lines 6148966.15 Above/ Below/P ar"
+        )
+        == "Schedule A-SOR items - Loop Lines"
+    )
+
+    products = ProductExtractor()._merge_all(
+        [
+            ProductItem(
+                s_no="1",
+                item_qty="10.00",
+                unit_rate="100.00",
+                amount="1000.00",
+                description="Supply of Widget A",
+                schedule="Schedule () 01-Supply Portion-I",
+            ),
+            ProductItem(
+                s_no="2",
+                item_code="NS2",
+                item_qty="5.00",
+                unit_rate="50.00",
+                amount="250.00",
+                description="Supply of Widget B",
+                schedule="Schedule Schedule 02-Supply Portion-II",
+            ),
+        ]
+    )
+    by_sno = {p.s_no: p for p in products}
+    assert by_sno["1"].item_code == "1"
+    assert by_sno["1"].schedule == "Schedule 01-Supply Portion-I"
+    assert by_sno["2"].item_code == "NS2"
+    assert by_sno["2"].schedule == "Schedule 02-Supply Portion-II"
+
+    row = ExportService().build_flat_rows(
+        TenderResult(
+            tender_information=TenderInformation(tender_no="T-1", name_of_work="Work"),
+            products=products,
+        )
+    )[0]
+    assert row["itemCode"] == "1"
+    assert row["itemCategory"] == "Schedule 01-Supply Portion-I"
+
+
+def test_ns_item_not_merged_with_same_sno_schedule_a():
+    """NS4 must not collapse into Schedule A serial 4 during the sno pass."""
+    products = ProductExtractor()._merge_all(
+        [
+            ProductItem(
+                s_no="4",
+                item_code="051160",
+                item_qty="100.00",
+                qty_unit="Metre",
+                unit_rate="10.00",
+                amount="1000.00",
+                description="Supply of cable",
+                schedule="Schedule A-Schedule A - Supply of Cables and relays",
+            ),
+            ProductItem(
+                s_no="4",
+                item_code="NS4",
+                item_qty="2000.00",
+                qty_unit="Metre",
+                unit_rate="1.24",
+                amount="2480.00",
+                description="Placing of warning tape while closing the trench",
+                schedule="Schedule A-Schedule A - Supply of Cables and relays",
+            ),
+            ProductItem(
+                s_no="1",
+                item_code="NS1",
+                item_qty="1.00",
+                qty_unit="Numbers",
+                unit_rate="10.00",
+                amount="10.00",
+                description="First NS item",
+                schedule="Schedule D-NS SCHEDULE",
+            ),
+        ]
+    )
+    by_code = {(p.item_code or "").upper(): p for p in products}
+    assert "NS4" in by_code
+    assert "051160" in by_code
+    ns4 = by_code["NS4"]
+    assert ns4.item_qty == "2000.00"
+    assert ns4.schedule and "NS" in ns4.schedule
+    assert ProductExtractor._schedule_letter(ns4.schedule) == "d"
+
+
+def test_qty_less_serial_description_folds_into_ns_item():
+    """Page-break '21 Description:-' must not sit beside NS21 as a second row."""
+    products = ProductExtractor()._merge_all(
+        [
+            ProductItem(
+                s_no="21",
+                item_code="NS21",
+                item_qty="7.00",
+                qty_unit="Numbers",
+                unit_rate="28868.70",
+                amount="202080.90",
+                description="Supply, installation, testing & commissioning of Wireless Access Point",
+                schedule="Schedule D-NS SCHEDULE",
+            ),
+            ProductItem(
+                s_no="21",
+                item_code="21",
+                description=(
+                    "Supply, installation, testing & commissioning of "
+                    "Wireless Access Point with 3000 Mbps"
+                ),
+                schedule="Schedule D-NS SCHEDULE",
+            ),
+        ]
+    )
+    matches = [p for p in products if (p.s_no == "21" or (p.item_code or "").upper() == "NS21")]
+    assert len(matches) == 1
+    ns21 = matches[0]
+    assert ns21.item_code == "NS21"
+    assert ns21.item_qty == "7.00"
+    assert "Wireless Access Point" in (ns21.description or "")
+
+
+def test_ns_code_amounts_with_serial_on_description_line():
+    """IREPS wrap: 'NS4 2000.00 Metre …' then '4 Description:- …'."""
+    sample = """
+Schedule () A-Supply of Cables 1000.00
+1 051160 100.00 Metre 10.00 1000.00 AT Par 1000.00 Rs.
+Description:- Supply of cable
+Schedule () D-NS SCHEDULE 21824682.99
+NS3 1.00 Numbers 100.00 100.00 AT Par 100.00 Rs.
+3 Description:- Previous NS item
+NS4 2000.00 Metre 1.24 2480.00 AT Par 2480.00 Rs.
+4 Description:- Placing of warning tape while closing the trench
+NS5 10.00 Numbers 50.00 500.00 AT Par 500.00 Rs.
+5 Description:- Next NS item
+"""
+    products = ProductExtractor().extract(sample)
+    by_code = {(p.item_code or "").upper(): p for p in products}
+    assert "NS4" in by_code
+    assert "NS5" in by_code
+    ns4 = by_code["NS4"]
+    assert ns4.item_qty == "2000.00"
+    assert ns4.unit_rate == "1.24"
+    assert ns4.amount == "2480.00"
+    assert "warning tape" in (ns4.description or "").lower()
+    assert ns4.schedule and "NS" in ns4.schedule
+    assert any(
+        (p.item_code or "") == "051160"
+        or (p.s_no == "1" and p.schedule and "A-Supply" in p.schedule)
+        for p in products
+    )
+
+
+def test_ns_continuation_table_keeps_schedule_d():
+    """Page-2 NS rows must inherit Schedule D, not leftover Schedule A."""
+    headers = [
+        "S.No.",
+        "Item Code",
+        "Item Qty",
+        "Qty Unit",
+        "Unit Rate",
+        "Basic Value",
+        "Escl.(%)",
+        "Amount",
+        "Bidding Unit",
+    ]
+    mapped = TableParser.map_headers(headers)
+    table_a = ExtractedTable(
+        page_number=1,
+        headers=headers,
+        rows=[
+            ["Schedule () A-Supply of Cables"] + [""] * 8,
+            ["1", "051160", "100.00", "Metre", "10.00", "1000.00", "AT Par", "1000.00", "Rs."],
+            ["Description:- Supply of cable"] + [""] * 8,
+            ["Schedule () D-NS SCHEDULE"] + [""] * 8,
+            ["1", "NS1", "1.00", "Numbers", "10.00", "10.00", "AT Par", "10.00", "Rs."],
+            ["Description:- First NS"] + [""] * 8,
+            ["3", "NS3", "1.00", "Numbers", "100.00", "100.00", "AT Par", "100.00", "Rs."],
+            ["Description:- Previous NS item"] + [""] * 8,
+        ],
+        mapped_headers=mapped,
+        is_product_table=True,
+    )
+    table_cont = ExtractedTable(
+        page_number=2,
+        headers=headers,
+        rows=[
+            ["4", "NS4", "2000.00", "Metre", "1.24", "2480.00", "AT Par", "2480.00", "Rs."],
+            ["4 Description:- Placing of warning tape while closing the trench"]
+            + [""] * 8,
+        ],
+        mapped_headers=mapped,
+        is_product_table=True,
+    )
+    products = ProductExtractor().extract("", tables=[table_a, table_cont])
+    ns4 = next(p for p in products if (p.item_code or "").upper() == "NS4")
+    assert ns4.item_qty == "2000.00"
+    assert "warning tape" in (ns4.description or "").lower()
+    assert ns4.schedule and "NS" in ns4.schedule
+    cable = next(p for p in products if (p.item_code or "") == "051160")
+    assert cable.schedule and "A-Supply" in cable.schedule
+
+
+def test_letter_code_page_break_keeps_serial_and_description():
+    """A 5.00 Numbers … / page break / 5 Description:- must stay one Schedule A row."""
+    sample = """
+Schedule () A-SOR items - Loop Lines 1000.00
+A 3.00 Numbers 15727.00 47181.00 AT Par 47181.00
+Description:- Supply of colour light signal post
+1
+A 5.00 Numbers 2331.00 11655.00 AT Par 11655.00
+Page 1 of 17 Run Date/Time: 11/08/2026 12:27:43
+ASANSOL DIVISION-S AND T/EASTERN RLY
+TENDER DOCUMENT
+Tender No: 44-SDSTE-ASN-2026-27 Closing Date/Time: 03/09/2026 14:00
+Description:- Fixing of Calling-on Signal/A-Sign/AG-Sign unit on signal post
+5
+A 2.00 Numbers 34117.00 68234.00 AT Par 68234.00
+6 Description:- Supply of non metallic FRP junction type route indicator
+"""
+    products = ProductExtractor().extract(sample)
+    sched_a = [
+        p for p in products
+        if ProductExtractor._schedule_letter(p.schedule) == "a"
+        and not ProductExtractor._is_breakup_schedule(p.schedule)
+    ]
+    by_sno = {p.s_no: p for p in sched_a}
+    assert "5" in by_sno
+    item5 = by_sno["5"]
+    assert (item5.item_code or "").upper() == "A"
+    assert item5.item_qty == "5.00"
+    assert item5.unit_rate == "2331.00"
+    assert "Calling-on" in (item5.description or "")
+    serials = [p.s_no for p in sched_a]
+    assert serials == sorted(serials, key=lambda s: int(s) if (s or "").isdigit() else 0)
+
+
+def test_item_breakup_does_not_steal_schedule_a_serial():
+    """Item 33 annexure rows must not merge into Schedule A item 5."""
+    sample = """
+Schedule () A-SOR items - Loop Lines 1000.00
+A 5.00 Numbers 2331.00 11655.00 AT Par 11655.00
+Description:- Fixing of Calling-on Signal unit on signal post
+5
+Please see Item Breakup for details. 235830.00 AT Par 235830.00
+Description:- Earthing of S&T equipment, relay rack and power equipment
+33
+Schedule () B-NON SOR items 500.00
+B 1.00 Numbers 100.00 100.00 AT Par 100.00
+1 Description:- Schedule B first item
+3. ITEM BREAKUP
+Schedule Schedule A-SOR items - Loop Lines
+Item- 33 earth shall be connected to copper flat of size 25x2 mm
+S No. Item Description of Item Unit Qty Rate Amount
+No
+1 1 Supply of basic material to construct unitNumbers 10.00 4720.00 47200.00
+2 2 Installation of Unit Maintenance Free Earth Numbers 10.00 3540.00 35400.00
+5 5 Supply of 1 x 35 Sq.mm. copper power wire Metre 40.00 177.00 7080.00
+Total 235830.00
+4. ELIGIBILITY CONDITIONS
+Standard Financial Criteria
+"""
+    products = ProductExtractor().extract(sample)
+    sched_a = [
+        p for p in products
+        if ProductExtractor._schedule_letter(p.schedule) == "a"
+        and not ProductExtractor._is_breakup_schedule(p.schedule)
+    ]
+    by_sno = {p.s_no: p for p in sched_a}
+    assert by_sno["5"].item_qty == "5.00"
+    assert by_sno["5"].qty_unit and "Number" in by_sno["5"].qty_unit
+    assert "Calling-on" in (by_sno["5"].description or "")
+    assert (by_sno["5"].item_code or "").upper() == "A"
+    assert "33" in by_sno
+    assert "Earthing" in (by_sno["33"].description or "")
+    assert by_sno["33"].amount == "235830.00"
+    assert by_sno["33"].item_qty == "1.00"
+    assert by_sno["33"].qty_unit == "Numbers"
+    assert by_sno["33"].unit_rate == "235830.00"
+    assert (by_sno["33"].item_code or "").upper() == "A"
+    assert by_sno["33"].parent_s_no is None
+
+    breakup = [p for p in products if ProductExtractor._is_breakup_schedule(p.schedule)]
+    assert len(breakup) >= 3
+    assert all(p.parent_s_no == "33" for p in breakup)
+    assert all(p.schedule == "Item 33 Breakup" for p in breakup)
+    br_by = {p.s_no: p for p in breakup}
+    assert br_by["5"].item_qty == "40.00"
+    assert br_by["5"].qty_unit and "Metre" in br_by["5"].qty_unit
+    assert br_by["5"].amount == "7080.00"
+    assert all("Breakup" in (p.schedule or "") for p in breakup)
+
+    sched_b = [
+        p for p in products if ProductExtractor._schedule_letter(p.schedule) == "b"
+    ]
+    assert len(sched_b) == 1
+    assert sched_b[0].item_qty == "1.00"
+
+
+def test_qty_less_serial_stub_folds_into_priced_schedule_row():
+    products = ProductExtractor()._merge_all(
+        [
+            ProductItem(
+                s_no="37",
+                item_code="A",
+                item_qty="6.00",
+                qty_unit="Set",
+                unit_rate="15147.00",
+                amount="90882.00",
+                schedule="Schedule A-SOR items",
+            ),
+            ProductItem(
+                s_no="37",
+                item_code="37",
+                description="Supply of basic material to construct unit maintenance free earth",
+                schedule="Schedule A-SOR items",
+            ),
+        ]
+    )
+    matches = [p for p in products if p.s_no == "37"]
+    assert len(matches) == 1
+    row = matches[0]
+    assert row.item_qty == "6.00"
+    assert (row.item_code or "").upper() == "A"
+    assert "maintenance free earth" in (row.description or "")
+
+
+def test_identical_amounts_keep_distinct_letter_code_serials():
+    """Two Schedule A rows can share qty/rate/amount and must not collapse."""
+    products = ProductExtractor()._merge_all(
+        [
+            ProductItem(
+                s_no="51",
+                item_code="A",
+                item_qty="50.00",
+                qty_unit="Numbers",
+                unit_rate="10.00",
+                amount="500.00",
+                description="Supply of end plate 2.5 mm",
+                schedule="Schedule A-SOR items",
+            ),
+            ProductItem(
+                s_no="52",
+                item_code="A",
+                item_qty="50.00",
+                qty_unit="Numbers",
+                unit_rate="10.00",
+                amount="500.00",
+                description="Supply of end stopper 10mm",
+                schedule="Schedule A-SOR items",
+            ),
+        ]
+    )
+    by_sno = {p.s_no: p for p in products}
+    assert "51" in by_sno and "52" in by_sno
+    assert "end plate" in (by_sno["51"].description or "")
+    assert "end stopper" in (by_sno["52"].description or "")
+
+
+def test_breakup_parent_qty_from_location_count():
+    """Lump-sum Item-N parent fills qty from '01 no. location' so qty × rate = amount."""
+    products = ProductExtractor()._merge_all(
+        [
+            ProductItem(
+                s_no="33",
+                item_code="A",
+                amount="235830.00",
+                description=(
+                    "Earthing of S&T equipment, relay rack and power equipment "
+                    "to be done at 01 no. location (station/cabin/hut)."
+                ),
+                schedule="Schedule A-SOR items - Loop Lines",
+            ),
+            ProductItem(
+                s_no="1",
+                item_code="1",
+                item_qty="10.00",
+                qty_unit="Numbers",
+                unit_rate="4720.00",
+                amount="47200.00",
+                description="Supply of basic material to construct unit",
+                schedule="Item 33 Breakup",
+            ),
+            ProductItem(
+                s_no="2",
+                item_code="2",
+                item_qty="10.00",
+                qty_unit="Numbers",
+                unit_rate="3540.00",
+                amount="35400.00",
+                description="Installation of Unit Maintenance Free Earth",
+                schedule="Item 33 Breakup",
+            ),
+        ]
+    )
+    parent = next(p for p in products if p.s_no == "33" and not ProductExtractor._is_breakup_schedule(p.schedule))
+    children = [p for p in products if ProductExtractor._is_breakup_schedule(p.schedule)]
+    assert parent.item_qty == "1.00"
+    assert parent.qty_unit == "Numbers"
+    assert parent.unit_rate == "235830.00"
+    assert parent.amount == "235830.00"
+    assert parent.parent_s_no is None
+    assert len(children) == 2
+    assert all(p.parent_s_no == "33" for p in children)
+    assert all(p.schedule == "Item 33 Breakup" for p in children)
+
+

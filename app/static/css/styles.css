@@ -386,6 +386,14 @@ div[data-testid="stForm"] button[data-testid="stBaseButton-primary"] {
 }
 .nf-bubble-text ul { margin: 0.4rem 0 0.2rem 1.1rem; padding: 0; }
 
+.nf-time {
+  display: block;
+  margin-top: 0.4rem;
+  font-size: 0.75rem;
+  color: var(--nf-muted) !important;
+  font-weight: 500;
+}
+
 .nf-file-row {
   display: flex;
   flex-wrap: wrap;
@@ -497,44 +505,45 @@ div[data-testid="stChatInput"] {
   margin: 0.35rem 0 0.6rem;
 }
 
-.main [data-testid="stHorizontalBlock"]:has(.nf-action-hit) {
-  margin-top: -0.35rem !important;
-  margin-bottom: 0.35rem !important;
-  min-height: 1.5rem;
-  opacity: 0;
-  transition: opacity 100ms ease;
-  justify-content: flex-end !important;
+[class*="st-key-nf_actions_"] {
+  margin: 0.1rem 0 0.55rem !important;
 }
 
-.main [data-testid="stHorizontalBlock"]:has(.nf-action-hit):hover,
-.main [data-testid="stHorizontalBlock"]:has(.nf-action-hit):focus-within,
-.main [data-testid="stElementContainer"]:has(.nf-row-user):hover
-  + [data-testid="stElementContainer"]
-  [data-testid="stHorizontalBlock"]:has(.nf-action-hit) {
-  opacity: 1 !important;
-}
-
-.main [data-testid="stHorizontalBlock"]:has(.nf-action-hit) .stButton > button {
-  min-height: 1.35rem !important;
-  min-width: auto !important;
-  height: auto !important;
-  padding: 0.1rem 0.4rem !important;
-  justify-content: center !important;
-  border-radius: 4px !important;
-  background: transparent !important;
-  border: none !important;
+[class*="st-key-nf_actions_"] .stButton > button {
+  min-height: 1.85rem !important;
+  height: 1.85rem !important;
+  min-width: 4.6rem !important;
+  padding: 0 0.75rem !important;
+  margin: 0 !important;
+  border-radius: 6px !important;
+  background: var(--nf-hover) !important;
+  border: 1px solid var(--nf-border) !important;
   box-shadow: none !important;
-  color: var(--nf-muted) !important;
-  font-size: 0.72rem !important;
+  color: var(--nf-text) !important;
+  font-size: 0.8rem !important;
   font-weight: 500 !important;
-  letter-spacing: 0.01em;
+  white-space: nowrap !important;
+  line-height: 1.85rem !important;
 }
 
-.main [data-testid="stHorizontalBlock"]:has(.nf-action-hit) .stButton > button:hover {
-  background: transparent !important;
+[class*="st-key-nf_actions_"] .stButton > button:hover {
+  background: var(--nf-input) !important;
   color: var(--nf-text) !important;
-  border: none !important;
-  text-decoration: underline;
+  border: 1px solid var(--nf-border) !important;
+  text-decoration: none !important;
+}
+
+.main [data-testid="stExpander"] {
+  background: var(--nf-user) !important;
+  border: 1px solid var(--nf-border) !important;
+  border-radius: 12px !important;
+  margin: 0.5rem 0 0.85rem !important;
+}
+
+.main [data-testid="stExpander"] summary,
+.main [data-testid="stExpander"] p {
+  color: var(--nf-text) !important;
+  font-size: 0.88rem !important;
 }
 
 @media (max-width: 768px) {

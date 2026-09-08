@@ -404,8 +404,10 @@ PRODUCT_SECTION_HINTS = re.compile(
 # Desc may be empty when the body starts on the next line:
 #   Description:-
 #   Supply of Disconnect Terminal Block...
+# IREPS also restates the serial on the same line as the label:
+#   4 Description:- Placing of warning tape...
 DESCRIPTION_LINE = re.compile(
-    r"(?im)^\s*description\s*[:\-–]\s*(?P<desc>.*?)\s*$"
+    r"(?im)^\s*(?:\d{1,4}\s+)?description\s*[:\-–]\s*(?P<desc>.*?)\s*$"
 )
 
 # Numeric schedule data row (fallback when table extraction is weak)
