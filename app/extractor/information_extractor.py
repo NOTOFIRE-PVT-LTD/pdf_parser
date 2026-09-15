@@ -23,8 +23,16 @@ from app.services.product_sanitize import sanitize_products
 logger = logging.getLogger(__name__)
 
 _LABEL_ECHO = re.compile(
-    r"(?i)^(?:bidding\s*(?:style|unit|type)|not\s*allowed|allowed(?:\s*\(.*\))?|"
-    r"documents?\s*uploading|tender\s*type|contract\s*(?:type|category))\s*$"
+    r"(?i)^(?:bidding\s*(?:style|unit|type|system)|not\s*allowed|allowed(?:\s*\(.*\))?|"
+    r"are\s*(?:jv|consortium)\s*allowed(?:\s*to\s*bid)?|"
+    r"number\s*of\s*(?:jv|consortium)\s*member(?:s)?(?:\s*allowed)?|"
+    r"consortium\s*member(?:s)?(?:\s*allowed)?|member\s*allowed|"
+    r"documents?\s*uploading|tender\s*type|contract\s*(?:type|category)|"
+    r"tendering\s*section|expenditure\s*type|ranking\s*order(?:\s*for\s*bids)?|"
+    r"validity\s*of\s*offer(?:\s*\(?\s*days?\s*\)?)?|bidding\s*start\s*date|"
+    r"date\s*time\s*of\s*uploading(?:\s*tender)?|pre-?bid\s*conference\s*required|"
+    r"signing\s*authority(?:\s*name|\s*designation)?|designation(?:\s*of\s*the\s*authority)?|"
+    r"name\s+of\s+(?:the\s+)?authority)\s*$"
 )
 
 def _looks_like_label_echo(value: str) -> bool:
@@ -62,7 +70,7 @@ class InformationExtractor:
         clauses = self.clauses.extract(text)
 
         products: list[ProductItem] = []
-        info = rule_info
+        info = self._merge_info(rule_info, None)
 
         if ai_available(settings):
             try:
@@ -107,17 +115,20 @@ class InformationExtractor:
         ai: TenderInformation | None,
     ) -> TenderInformation:
         """Prefer non-empty AI fields; keep rule values when AI left null."""
-        if ai is None:
-            return rule
         data = rule.model_dump()
-        for key, value in ai.model_dump().items():
-            if value is None:
-                continue
-            if isinstance(value, str) and not value.strip():
-                continue
+        for key, value in list(data.items()):
             if isinstance(value, str) and _looks_like_label_echo(value):
-                continue
-            cur = data.get(key)
-            if cur is None or (isinstance(cur, str) and len(str(value)) >= len(str(cur))):
-                data[key] = value
+                data[key] = None
+
+        if ai is not None:
+            for key, value in ai.model_dump().items():
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                if isinstance(value, str) and _looks_like_label_echo(value):
+                    continue
+                cur = data.get(key)
+                if cur is None or (isinstance(cur, str) and len(str(value)) >= len(str(cur))):
+                    data[key] = value
         return TenderInformation(**data)

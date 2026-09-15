@@ -486,7 +486,7 @@ class ProductExtractor:
             if description:
                 description = re.sub(r"(?i)^description\s*[:\-–]\s*", "", description).strip()
                 description = description.lstrip("-–— ").strip()
-                description = clean_item_description(description)
+                description = clean_item_description(description, s_no=s_no, item_code=item_code)
 
             # Accept row if it has qty OR rate/amount OR description
             if not any([item_qty, cell("unit_rate"), cell("amount"), description, item_code]):
@@ -995,7 +995,7 @@ class ProductExtractor:
         if not parts:
             return None, i + 1
         text = collapse_whitespace(" ".join(parts)).lstrip("-–— \"'").strip()
-        text = clean_item_description(text) or ""
+        text = clean_item_description(text, s_no=sno) or ""
         if not text or JUNK_DESC.search(text):
             return None, j
         return text, j
@@ -1968,9 +1968,9 @@ class ProductExtractor:
             if not p.bidding_unit or str(p.bidding_unit).lower() in {"none", "null"}:
                 p.bidding_unit = None
             if p.description:
-                p.description = clean_item_description(p.description) or p.description.lstrip(
-                    "-–— "
-                ).strip()
+                p.description = clean_item_description(
+                    p.description, s_no=p.s_no, item_code=p.item_code
+                ) or p.description.lstrip("-–— ").strip()
             if p.schedule:
                 p.schedule = self._clean_schedule_title(p.schedule)
             self._apply_default_item_code(p)

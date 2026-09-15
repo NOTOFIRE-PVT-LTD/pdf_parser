@@ -341,11 +341,134 @@ def is_list_serial(value: str | None) -> bool:
     return 1 <= n <= 999
 
 
-def clean_item_description(value: str | None) -> str | None:
-    """Repair spacing, drop chrome, collapse leftover whitespace."""
+_SPEC_UNITS = re.compile(
+    r"(?i)^(?:pair|pairs|core|cores|quad|quads|sqmm|sq\s*mm|mm|cm|m|meter|meters|metre|metres|"
+    r"mtr|mtrs|kg|kgs|volt|volts|v|kv|kw|hp|amp|amps|amperes|mhz|ghz|gb|tb|mb|way|ways|"
+    r"port|ports|pin|pins|channel|channels|strand|strands|inch|inches|nos|no|number|numbers|"
+    r"digit|digits|slot|slots|shelf|shelves|rack|racks|ton|tons|tonne|tonnes|litre|litres|ltr|ltrs|"
+    r"unit|units|percent|%|degree|degrees|c|f|ohm|ohms|ah|va|kva|var|kvar|hz|khz)$"
+)
+
+_COMMON_WORD_FRAGMENTS = {
+    "th", "wh", "sh", "ch", "br", "cl", "cr", "dr", "fr", "gl", "gr", "pl", "pr", "sc", "sk", "sl", "sm", "sn", "sp", "st", "sw", "tr"
+}
+
+_SPEC_PREFIXES = re.compile(
+    r"(?i)\b(?:is|irs|rdso|bs|iec|en|iso|sem|drg|drawing|spec|specification|no|ref|cat|part|table|fig|figure|type)\.?\s*$"
+)
+
+
+def strip_stray_item_number(
+    value: str | None,
+    s_no: str | None = None,
+    item_code: str | None = None,
+) -> str | None:
+    """
+    Remove stray S.No / item_code numbers interleaved into description prose by PDF parsers.
+
+    Example artifacts handled:
+      - Item 4: "... tinned 4 copper conductor ..." -> "... tinned copper conductor ..."
+      - Item 10: "... direction 10 of Engineer ..." -> "... direction of Engineer ..."
+      - Item 25: "... along with 25 plug board ..." -> "... along with plug board ..."
+      - Item 26: "... thread collars 26 as per IS 1239 ..." -> "... thread collars as per IS 1239 ..."
+      - Item 27: "... GI pipes... 27 filled with ..." -> "... GI pipes... filled with ..."
+      - Item 22: "... ratio 1:3:6 of cement, 22 coarse ..." -> "... ratio 1:3:6 of cement, coarse ..."
+    """
+    if not value:
+        return value
+
+    text = str(value).strip()
+
+    # Collect candidate numbers associated with this line item (s_no or numeric item_code)
+    nums: set[str] = set()
+    if s_no and re.fullmatch(r"\d{1,4}", str(s_no).strip()):
+        nums.add(str(int(s_no.strip())))
+    if item_code and re.fullmatch(r"\d{1,4}", str(item_code).strip()):
+        nums.add(str(int(item_code.strip())))
+    elif item_code:
+        m = re.search(r"\d{1,4}", str(item_code).strip())
+        if m:
+            nums.add(str(int(m.group(0))))
+
+    # 1. Strip leading "Item 4:", "Item 4 (Non-SOR):", "Item 4 -", "4 Description:-", "4: "
+    for n in nums:
+        lead_pattern = re.compile(
+            rf"(?i)^\s*(?:item\s+{n}\s*(?:\([^)]*\))?\s*[:\-–]?|{n}\s*description\s*[:\-–]|{n}\s*[:\-–])\s*"
+        )
+        text = lead_pattern.sub("", text).strip()
+
+    text = re.sub(
+        r"(?i)^\s*item\s+\d{1,4}\s*(?:\([^)]*\))?\s*[:\-–]\s*",
+        "",
+        text,
+    ).strip()
+
+    if not nums:
+        return collapse_whitespace(text) or text
+
+    # 2. Strip stray injected item serial numbers from description prose
+    def _replace_stray_integer(m: re.Match[str]) -> str:
+        prefix_text = m.group(1).strip()
+        num_str = m.group(2)
+        next_word = m.group(3)
+
+        if num_str not in nums:
+            return m.group(0)
+
+        if _SPEC_PREFIXES.search(prefix_text):
+            return m.group(0)
+        if _SPEC_UNITS.match(next_word):
+            return m.group(0)
+
+        clean_prefix = re.sub(r"[^\w]", "", prefix_text.lower())
+        clean_next = re.sub(r"[^\w]", "", next_word.lower())
+        if clean_prefix in _COMMON_WORD_FRAGMENTS or (len(clean_prefix) <= 3 and len(clean_next) <= 2):
+            return m.group(1) + m.group(3)
+
+        return m.group(1) + " " + m.group(3)
+
+    pattern = re.compile(
+        r"([A-Za-z0-9,;:\)\.\'\"]+)\s+(\d{1,4})\s+([A-Za-z]+)"
+    )
+    text = pattern.sub(_replace_stray_integer, text)
+
+    return collapse_whitespace(text) or text
+
+
+def clean_item_description(
+    value: str | None,
+    s_no: str | None = None,
+    item_code: str | None = None,
+) -> str | None:
+    """Repair spacing, drop chrome, strip stray item serial numbers, collapse leftover whitespace."""
     text = collapse_whitespace(value)
     text = repair_spaced_text(text)
+    if text:
+        # Fix PDF font ligatures (fi, fl, ff) split by space
+        # e.g. "Specifi cation" -> "Specification", "Non fl ame" -> "Non flame", "speci fi cation" -> "specification"
+        text = re.sub(r"\b([A-Za-z]{2,})fi\s+([a-z]{2,})\b", r"\1fi\2", text)
+        text = re.sub(r"\b([A-Za-z]{2,})fl\s+([a-z]{2,})\b", r"\1fl\2", text)
+        text = re.sub(r"\b([A-Za-z]{2,})ff\s+([a-z]{2,})\b", r"\1ff\2", text)
+        text = re.sub(r"\bfl\s+([a-z]{2,})\b", r"fl\1", text)
+        text = re.sub(r"\bfi\s+([a-z]{2,})\b", r"fi\1", text)
+        text = re.sub(r"\bff\s+([a-z]{2,})\b", r"ff\1", text)
+
+        # Fix duplicate phrases
+        text = re.sub(r"(?i)\b(as\s+per)(?:\s+\1)+\b", r"\1", text)
+
+        # Fix split drawing/specification numbers: e.g. "SK.9/1 1" -> "SK.9/11", "1. 1" -> "1.1"
+        text = re.sub(r"([A-Z0-9_\-\.]+/\d+)\s+(\d+)\b", r"\1\2", text)
+        text = re.sub(r"(\b\d+)\.\s+(\d+)\b", r"\1.\2", text)
+        text = re.sub(r"(\b\d+)\s+\.(\d+)\b", r"\1.\2", text)
+
+        # Fix missing space before parenthesis after period: "latest.(Inspection" -> "latest. (Inspection"
+        text = re.sub(r"(\b[a-zA-Z0-9]+)\.\(([A-Za-z])", r"\1. (\2", text)
+
+        # Fix merged camelCase words from PDF layout text stream: "existingStation" -> "existing Station"
+        text = re.sub(r"\b([a-z]{3,})([A-Z][a-z]{3,})\b", r"\1 \2", text)
+
     text = strip_description_chrome(text)
+    text = strip_stray_item_number(text, s_no=s_no, item_code=item_code)
     return text or None
 
 

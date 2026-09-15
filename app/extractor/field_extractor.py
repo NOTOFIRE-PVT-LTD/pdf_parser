@@ -77,16 +77,36 @@ class FieldExtractor:
         if tables:
             from_tables = self._extract_from_nit_tables(tables)
             for key, value in from_tables.items():
-                if value and (not data.get(key) or key == "name_of_work"):
-                    if key == "name_of_work" and data.get("name_of_work"):
-                        if len(value) > len(data["name_of_work"]):
+                if value:
+                    cur = data.get(key)
+                    if (
+                        not cur
+                        or (isinstance(cur, str) and self._looks_like_label(cur))
+                        or key
+                        in {
+                            "consortium_members_allowed",
+                            "signing_authority_name",
+                            "signing_authority_designation",
+                            "bidding_style",
+                        }
+                    ):
+                        if key == "tender_no":
+                            cleaned = self._clean_tender_no(value)
+                            if cleaned:
+                                data[key] = cleaned
+                        else:
                             data[key] = value
-                    elif key == "tender_no":
-                        cleaned = self._clean_tender_no(value)
-                        if cleaned:
-                            data[key] = cleaned
-                    else:
-                        data[key] = value
+                    elif key == "name_of_work" and cur:
+                        if len(value) > len(cur):
+                            data[key] = value
+
+        # Signing authority from full document (if not captured from table/block)
+        if not data.get("signing_authority_name") or not data.get("signing_authority_designation"):
+            s_name, s_desig = self._extract_signing_authority(text)
+            if s_name and not data.get("signing_authority_name"):
+                data["signing_authority_name"] = s_name
+            if s_desig and not data.get("signing_authority_designation"):
+                data["signing_authority_designation"] = s_desig
 
         # Dedicated Name of Work capture (multi-line until next NIT label)
         if not data.get("name_of_work") or len(data.get("name_of_work") or "") < 40:
@@ -228,7 +248,9 @@ class FieldExtractor:
             if not value or key in {"name_of_work", "tender_no"}:
                 continue
             clipped = self._clip_nit_value(str(value))
-            if clipped:
+            if clipped and self._looks_like_label(clipped):
+                data[key] = None
+            elif clipped:
                 data[key] = clipped
 
         # IREPS has no separate reference number — portal templates reuse Tender No
@@ -649,10 +671,12 @@ class FieldExtractor:
             )
             if pm:
                 raw = collapse_whitespace(self._refine_value(pm.group("val"), hint))
-                out[field] = truncate(self._clip_nit_value(raw), 500)
-                continue
+                val = truncate(self._clip_nit_value(raw), 500)
+                if val and not self._is_placeholder(val) and not self._looks_like_label(val):
+                    out[field] = val
+                    continue
             val = self._find_labeled_value(block, [label], value_hint=hint)
-            if val:
+            if val and not self._is_placeholder(val) and not self._looks_like_label(val):
                 out[field] = val
         return out
 
@@ -677,6 +701,26 @@ class FieldExtractor:
             ("pre_bid_required", re.compile(r"(?i)^pre-?bid\s+conference\s+required$")),
             ("jv_allowed", re.compile(r"(?i)^are\s+jv\s+allowed")),
             ("consortium_allowed", re.compile(r"(?i)^are\s+consortium\s+allowed")),
+            (
+                "consortium_members_allowed",
+                re.compile(
+                    r"(?i)^(?:number\s+of\s+consortium\s+member|consortium\s+member(?:s)?\s+allowed)"
+                ),
+            ),
+            ("ranking_order", re.compile(r"(?i)^ranking\s*order")),
+            ("expenditure_type", re.compile(r"(?i)^expenditure\s*type$")),
+            (
+                "signing_authority_name",
+                re.compile(
+                    r"(?i)^(?:signed\s*by|(?:signing\s+)?authority\s*name|name\s+of\s+(?:the\s+)?authority)$"
+                ),
+            ),
+            (
+                "signing_authority_designation",
+                re.compile(
+                    r"(?i)^(?:designation|(?:signing\s+)?authority\s*designation|designation\s+of\s+(?:the\s+)?authority)$"
+                ),
+            ),
             ("status", re.compile(r"(?i)^(?:tender\s+)?status$")),
             ("reference_no", re.compile(r"(?i)^reference\s*(?:no\.?|number)$")),
         ]
@@ -904,14 +948,40 @@ class FieldExtractor:
             return False
         return bool(
             re.fullmatch(
-                r"(?:bidding\s*type|tender\s*type|bidding\s*system|tendering\s*section|"
+                r"(?:bidding\s*type|bidding\s*unit|bidding\s*system|tender\s*type|tendering\s*section|"
                 r"contract\s*type|contract\s*category|advertised\s*value|"
                 r"earnest\s*money|period\s+of\s+completion|name\s+of\s+work|"
                 r"pre-?bid\s+conference(?:\s+required)?|validity\s+of\s+offer|"
-                r"bidding\s*style|bidding\s*unit|expenditure\s*type)",
+                r"bidding\s*style|expenditure\s*type|ranking\s*order(?:\s*for\s*bids)?|"
+                r"are\s*(?:jv|consortium)\s*allowed(?:\s*to\s*bid)?|"
+                r"number\s*of\s*(?:jv|consortium)\s*member(?:s)?(?:\s*allowed)?|"
+                r"consortium\s*member(?:s)?(?:\s*allowed)?|member\s*allowed|"
+                r"signing\s*authority(?:\s*name|\s*designation)?|designation(?:\s*of\s*the\s*authority)?)",
                 v,
             )
         )
+
+    def _extract_signing_authority(self, text: str) -> tuple[str | None, str | None]:
+        name, desig = None, None
+        m_name = re.search(
+            r"(?im)(?:signed\s*by|signing\s*authority(?:\s*name)?)\s*[:\-–]?\s*([A-Za-z][A-Za-z0-9 .\-/]{1,80})",
+            text,
+        )
+        if m_name:
+            cand = collapse_whitespace(m_name.group(1))
+            if cand and not self._looks_like_label(cand) and not self._is_placeholder(cand):
+                name = truncate(cand, 200)
+
+        m_desig = re.search(
+            r"(?im)(?:designation|(?:signing\s+)?authority\s*designation)\s*[:\-–]?\s*([A-Za-z][A-Za-z0-9 .\-/]{1,80})",
+            text,
+        )
+        if m_desig:
+            cand = collapse_whitespace(m_desig.group(1))
+            if cand and not self._looks_like_label(cand) and not self._is_placeholder(cand):
+                desig = truncate(cand, 200)
+
+        return name, desig
 
     @staticmethod
     def _infer_currency(text: str) -> str | None:

@@ -14,7 +14,7 @@ from app.utils.product_name import (
     normalize_product_description,
     recheck_product_name,
 )
-from app.utils.text_utils import is_list_serial
+from app.utils.text_utils import is_list_serial, strip_stray_item_number
 
 _JUNK_DESC = re.compile(
     r"(?i)^(s\.?no\.?|item\s*code|item\s*qty|description\s*:?-?|"
@@ -121,10 +121,13 @@ def sanitize_products(raw_products: list[Any]) -> list[ProductItem]:
             continue
 
         sno = str(data.get("s_no") or "").strip()
+        code = str(data.get("item_code") or "").strip()
         if sno and not re.fullmatch(r"\d+", sno):
             continue
 
-        desc = normalize_product_description(_clean_description(data.get("description")))
+        desc = normalize_product_description(_clean_description(data.get("description")), s_no=sno, item_code=code)
+        if desc:
+            desc = strip_stray_item_number(desc, s_no=sno, item_code=code)
         if not _is_valid_row(data, desc):
             continue
 

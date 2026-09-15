@@ -9,6 +9,7 @@ import re
 
 from app.extractor.clause_extractor import ClauseExtractor
 from app.extractor.field_extractor import FieldExtractor
+from app.extractor.information_extractor import InformationExtractor
 from app.extractor.product_extractor import ProductExtractor
 from app.parser.table_parser import ExtractedTable, TableParser
 from app.services.export_service import ExportService
@@ -102,6 +103,34 @@ Email: dycste@example.com
 """
 
 
+RAILWAY_SCRAMBLED_SAMPLE = """
+MUMBAI CENTRAL DIVISION-S AND T/WESTERN RLY
+TENDER DOCUMENT
+Tender No: DYCSTE_Works_PSSA_02R                 Closing Date/Time: 18/06/2026 15:00
+--------------------------------------------------------------------------------
+Dy.CSTE/WORKS/MMCT acting for and on behalf of The President of India invites E-Tenders against Tender No DYCSTE_Works_PSSA_02R Closing Date/Time 18/06/2026 15:00 Hrs.
+
+1. NIT HEADER
+Single Rate for Each
+Bidding Style Bidding Unit
+Schedule
+
+Number of JV Member
+Are JV allowed to bid No 0
+Allowed
+Are Consortium allowed Number of Consortium
+No 0
+to bid Member Allowed
+Ranking Order For Bids Lowest to Highest Expenditure Type Capital (Works)
+
+2. SCHEDULE
+Some schedule details here.
+
+Signed By: UDIT NARAYAN
+Designation: Sr.DEN/Co/LKO
+"""
+
+
 GENERIC_SAMPLE = """
 NOTICE INVITING TENDER
 NIT No: NIT/PWD/2024/118
@@ -167,6 +196,49 @@ Number of JV Member Allowed 3
     assert info.reference_no == "DYCSTE_Works_PSSA_02R"
     assert info.status is None  # IREPS NIT PDFs usually omit tender status
     assert info.pdf_url is None  # no document URL in the NIT text
+
+
+def test_railway_scrambled_layout():
+    """
+    Test extraction when pdfplumber scrambles multi-column header text:
+    - bidding_style should NOT echo 'Bidding Unit'
+    - signing authority name and designation extracted from end of document
+    - consortium_members_allowed extracted correctly from table if table passed
+    """
+    info = FieldExtractor().extract_tender_information(RAILWAY_SCRAMBLED_SAMPLE)
+    assert info.bidding_style != "Bidding Unit"
+    assert info.bidding_style is None or "Single Rate" in info.bidding_style
+    assert info.signing_authority_name == "UDIT NARAYAN"
+    assert info.signing_authority_designation == "Sr.DEN/Co/LKO"
+
+    # Test with extracted table provided (cell-accurate structure from pdfplumber)
+    header_table = ExtractedTable(
+        headers=["Bidding Style", "Single Rate for Each", "Bidding Unit", "Schedule"],
+        rows=[
+            ["Are JV allowed to bid", "No", "Number of JV Member Allowed", "0"],
+            ["Are Consortium allowed to bid", "No", "Number of Consortium Member Allowed", "0"],
+            ["Ranking Order For Bids", "Lowest to Highest", "Expenditure Type", "Capital (Works)"],
+            ["Signed By", "UDIT NARAYAN", "Designation", "Sr.DEN/Co/LKO"],
+        ],
+        page_number=1,
+    )
+
+    info_table = FieldExtractor().extract_tender_information(
+        RAILWAY_SCRAMBLED_SAMPLE, tables=[header_table]
+    )
+    assert info_table.bidding_style == "Single Rate for Each"
+    assert info_table.consortium_members_allowed == "0"
+    assert info_table.signing_authority_name == "UDIT NARAYAN"
+    assert info_table.signing_authority_designation == "Sr.DEN/Co/LKO"
+
+
+def test_information_extractor_label_echo_guard():
+    """Ensure InformationExtractor cleans label echoes from rule_info even without AI."""
+    res = InformationExtractor().extract(RAILWAY_SCRAMBLED_SAMPLE)
+    info = res.tender_information
+    assert info.bidding_style != "Bidding Unit"
+    assert info.signing_authority_name == "UDIT NARAYAN"
+    assert info.signing_authority_designation == "Sr.DEN/Co/LKO"
 
 
 def test_no_duplicate_products_with_different_sno():
