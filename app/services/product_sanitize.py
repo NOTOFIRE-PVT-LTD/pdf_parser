@@ -23,6 +23,10 @@ _JUNK_DESC = re.compile(
     r"schedule\s*total|grand\s*total|meaning\s+of\s+similar)\b"
 )
 
+# Bidding-unit column only ever legitimately holds one of these — anything
+# else (stray labels, "Not Allowed" bled in from an unrelated table column) is junk.
+_VALID_BIDDING_UNIT = re.compile(r"(?i)^(?:at\s*par|above\s*/\s*below\s*/\s*par|rs\.?|inr)$")
+
 
 def _clean_description(value: str | None) -> str | None:
     if not value:
@@ -154,10 +158,14 @@ def sanitize_products(raw_products: list[Any]) -> list[ProductItem]:
             data["escalation"] = re.sub(
                 r"(?i)at\s*par", "AT Par", str(data["escalation"])
             ).strip()
+
         if not data.get("bidding_unit") or str(data.get("bidding_unit")).lower() in {
             "none", "null", "",
         }:
             data["bidding_unit"] = None
+        elif not _VALID_BIDDING_UNIT.match(str(data["bidding_unit"]).strip()):
+            data["bidding_unit"] = None
+
         cleaned.append(ProductItem(**data))
 
     merged = ProductExtractor._normalize_schedule_items(cleaned)

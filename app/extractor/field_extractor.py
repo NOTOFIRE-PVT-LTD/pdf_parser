@@ -625,8 +625,8 @@ class FieldExtractor:
             "consortium_allowed": r"(?:are\s+)?consortium\s+allowed(?:\s+to\s+bid)?",
             "consortium_members_allowed": r"number\s+of\s+consortium\s+member(?:s)?\s+allowed",
             "ranking_order": r"ranking\s*order(?:\s+for\s+bids)?",
-            "signing_authority_name": r"(?:signing\s+)?authority\s*name|name\s+of\s+(?:the\s+)?authority",
-            "signing_authority_designation": r"(?:signing\s+)?authority\s*designation|designation\s+of\s+(?:the\s+)?authority",
+            "signing_authority_name": r"signed\s*by|(?:signing\s+)?authority\s*name|name\s+of\s+(?:the\s+)?authority",
+            "signing_authority_designation": r"designation\s*(?::|$)|(?:signing\s+)?authority\s*designation|designation\s+of\s+(?:the\s+)?authority",
             "pdf_url": r"(?:tender\s+)?(?:pdf\s*)?url|document\s*url",
         }
         for field, label in pairs.items():

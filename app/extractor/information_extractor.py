@@ -9,6 +9,7 @@ run only as fallback / merge seed when AI is unavailable or returns nothing.
 from __future__ import annotations
 
 import logging
+import re
 
 from app.config import get_settings
 from app.extractor.clause_extractor import ClauseExtractor
@@ -21,6 +22,13 @@ from app.services.product_sanitize import sanitize_products
 
 logger = logging.getLogger(__name__)
 
+_LABEL_ECHO = re.compile(
+    r"(?i)^(?:bidding\s*(?:style|unit|type)|not\s*allowed|allowed(?:\s*\(.*\))?|"
+    r"documents?\s*uploading|tender\s*type|contract\s*(?:type|category))\s*$"
+)
+
+def _looks_like_label_echo(value: str) -> bool:
+    return bool(_LABEL_ECHO.match(value.strip()))
 
 class InformationExtractor:
     """AI-first tender extraction with offline rule fallback."""
@@ -106,6 +114,8 @@ class InformationExtractor:
             if value is None:
                 continue
             if isinstance(value, str) and not value.strip():
+                continue
+            if isinstance(value, str) and _looks_like_label_echo(value):
                 continue
             cur = data.get(key)
             if cur is None or (isinstance(cur, str) and len(str(value)) >= len(str(cur))):

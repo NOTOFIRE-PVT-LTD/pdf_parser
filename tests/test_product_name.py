@@ -314,8 +314,36 @@ def test_spec_number_extracts_canonical_ids_not_english_fragments():
             None,
         ),
         (
+            "as per RDSO Specification No. RDSO/SPN/TC/82/2020 Rev. 2.0 or latest",
+            "RDSO/SPN/TC/82/2020 Rev. 2.0",
+        ),
+        (
+            "as per RDSO Specification No. RDSO/SPN/192/2019 Ver. or latest",
+            "RDSO/SPN/192/2019",
+        ),
+        (
+            "as per RDSO specno.RDSO/SPN/TC/68/2014 Wwithrev.2.0",
+            "RDSO/SPN/TC/68/2014",
+        ),
+        (
+            "as per RDSO specification No.RDSO/Spn/197 ver.1 effective from 04.07.2016",
+            "RDSO/SPN/197 Ver. 1",
+        ),
+        (
+            "as per RDSO specification No IRS:TC-68/2012 Rev.0 Amdt.1",
+            "IRS:TC-68/2012",
+        ),
+        (
+            "as per RDSO specification No. STS/E/TAN/3006 dated 26.06.2025",
+            "STS/E/TAN/3006",
+        ),
+        (
             "(i) Supply of 4 conductor disconnect terminal block as per RDSO Spcn. No. RDSO/SPN/189/2004 Ver. 3.0 or latest.",
             "RDSO/SPN/189/2004 Ver. 3.0",
+        ),
+        (
+            "supplied in sealed bag as per specification ification of EI system",
+            None,
         ),
     ]
     for desc, expected in spec_cases:

@@ -525,11 +525,14 @@ class ProductNameLearning:
         }
 
 
-# Canonical spec IDs only — never English leftovers like "ifications" / "tion".
+# Canonical spec IDs only — never English leftovers like "ification" / "tion".
+_SPEC_VERSION = r"(?:\s*(?:Ver(?:sion)?\.?|Rev\.?)\s*\d[\d.]*)?"
 _SPEC_ID = re.compile(
     r"(?i)("
-    r"RDSO\s*/\s*SPN\s*/\s*\d{2,4}\s*/\s*\d{4}"
-    r"(?:\s*(?:Ver(?:sion)?\.?|Rev\.?)\s*[\d.]+)?"
+    r"RDSO\s*/\s*SPN\s*/\s*(?:[A-Z]{1,6}\s*/\s*)?\d{2,6}(?:\s*/\s*\d{4})?"
+    + _SPEC_VERSION
+    + r"|"
+    r"STS\s*/\s*E\s*/\s*TAN\s*/\s*\d{3,8}"
     r"|"
     r"IRS\s*:?\s*(?:S|TC)\s*[-–]?\s*\d{1,3}"
     r"(?:\s*[/\-]\s*\d{2,4})?"
@@ -543,6 +546,9 @@ _SPEC_ID = re.compile(
     r"|"
     r"IEC\s*[-–]?\s*\d{4,6}(?:[-–]\d+)?"
     r")"
+)
+_SPEC_FRAGMENT = re.compile(
+    r"(?i)^(ific(?:ation)?s?|tion|ific|ified|specified|contractor|specn\.?|spec)$"
 )
 
 _DRAWING_ID = re.compile(
@@ -568,20 +574,38 @@ _INSPECTION_AGENCY = re.compile(
 
 def _prep_spec_text(text: str) -> str:
     text = re.sub(r"(?i)specifi\s+cation", "specification", text)
+    text = re.sub(r"(?i)\bspec\s+ification", "specification", text)
     text = re.sub(r"(?i)specn\s*\.\s*no", "specn. no", text)
     text = re.sub(r"(?i)spec\s*\.\s*no", "spec. no", text)
+    text = re.sub(r"(?i)RDSO\s*/\s*SPN(?=\d)", "RDSO/SPN/", text)
+    text = re.sub(r"(?i)(RDSO/SPN)/[ \t\n\r]+", r"\1/", text)
     return text
 
 
 def _tidy_spec_id(raw: str) -> str:
     s = re.sub(r"\s+", " ", raw).strip()
+    s = re.sub(r"(?i)\bRDSO\s*/\s*SPN\s*/\s*", "RDSO/SPN/", s)
     s = re.sub(r"(?i)\bRDSO\s*/\s*", "RDSO/", s)
+    s = re.sub(r"(?i)\bSTS\s*/\s*E\s*/\s*TAN\s*/\s*", "STS/E/TAN/", s)
     s = re.sub(r"(?i)\bIRS\s*:\s*", "IRS:", s)
     s = re.sub(r"(?i)IRS:(S|TC)\s*[-–]\s*", lambda m: f"IRS:{m.group(1).upper()}-", s)
     s = re.sub(r"(?i)\bIS\s*:\s*", "IS:", s)
     s = re.sub(r"(?i)IRS:(S|TC)\s+", lambda m: f"IRS:{m.group(1).upper()}-", s)
-    s = re.sub(r"(?i)\bversion\b", "Ver.", s)
+    s = re.sub(r"(?i)\bver(?:sion)?\.?\s*", "Ver. ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"(?i)\s+Ver\.\s*$", "", s).strip()
     return s
+
+
+def _is_real_spec_id(spec: str) -> bool:
+    s = spec.strip()
+    if len(s) < 8 or not re.search(r"\d", s):
+        return False
+    if _SPEC_FRAGMENT.fullmatch(s):
+        return False
+    if re.fullmatch(r"(?i)RDSO/SPN/?", s):
+        return False
+    return True
 
 
 def extract_item_specs(desc: str | None) -> str | None:
@@ -597,6 +621,8 @@ def extract_item_spec_number(desc: str | None) -> str | None:
     seen: set[str] = set()
     for m in _SPEC_ID.finditer(text):
         spec = _tidy_spec_id(m.group(1))
+        if not _is_real_spec_id(spec):
+            continue
         key = re.sub(r"[\s.:]", "", spec).upper()
         if not spec or key in seen:
             continue
