@@ -86,6 +86,9 @@ def _is_valid_row(data: dict[str, Any], desc: str | None) -> bool:
     has_sno = bool(sno and re.fullmatch(r"\d+", sno))
     schedule = str(data.get("schedule") or "")
 
+    if not desc or len(desc.strip()) <= 3:
+        if not (has_qty and has_money):
+            return False
     if desc and (_JUNK_DESC.search(desc) or is_clause_or_junk(desc)):
         return False
     item_code = str(data.get("item_code") or "")

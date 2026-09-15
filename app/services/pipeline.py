@@ -103,7 +103,7 @@ class TenderPipeline:
             progress("AI analyzing PDF…", 0.7)
         else:
             progress("Extracting information", 0.75)
-        result = self.extractor.extract(text, tables=tables, meta=meta)
+        result = self.extractor.extract(text, tables=tables, meta=meta, pdf_path=path)
         result.status = ExtractionStatus.COMPLETED
         result.meta = meta
         result.tables = [

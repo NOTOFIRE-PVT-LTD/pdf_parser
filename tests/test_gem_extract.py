@@ -142,3 +142,15 @@ def test_gem_catalogue_table_still_works():
     products = sanitize_products(raw)
     assert len(products) >= 2
     assert products[0].item_qty == "10"
+
+
+def test_extract_with_gemini_vision_graceful_missing_key():
+    from app.services.ai.pdf_extract_agent import extract_with_gemini_vision
+    from app.config import Settings
+
+    s = Settings(gemini_api_key="")
+    info, products, err = extract_with_gemini_vision("non_existent.pdf", settings=s)
+    assert info is None
+    assert products == []
+    assert err == "gemini_api_key_missing"
+

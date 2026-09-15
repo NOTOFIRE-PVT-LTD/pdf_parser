@@ -56,6 +56,7 @@ class InformationExtractor:
         text: str,
         tables: list[ExtractedTable] | None = None,
         meta: DocumentMeta | None = None,
+        pdf_path: str | Path | None = None,
     ) -> TenderResult:
         settings = get_settings()
         warnings: list[str] = []
@@ -74,7 +75,9 @@ class InformationExtractor:
 
         if ai_available(settings):
             try:
-                ai_info, ai_products, err = extract_with_ai(text, tables=tables, settings=settings)
+                ai_info, ai_products, err = extract_with_ai(
+                    text, tables=tables, pdf_path=pdf_path, settings=settings
+                )
                 if ai_products:
                     products = sanitize_products(ai_products)
                     info = self._merge_info(rule_info, ai_info)

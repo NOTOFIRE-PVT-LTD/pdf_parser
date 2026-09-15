@@ -382,13 +382,17 @@ def strip_stray_item_number(
     # Collect candidate numbers associated with this line item (s_no or numeric item_code)
     nums: set[str] = set()
     if s_no and re.fullmatch(r"\d{1,4}", str(s_no).strip()):
-        nums.add(str(int(s_no.strip())))
-    if item_code and re.fullmatch(r"\d{1,4}", str(item_code).strip()):
-        nums.add(str(int(item_code.strip())))
-    elif item_code:
+        n_val = int(s_no.strip())
+        nums.add(str(n_val))
+        nums.add(f"{n_val:02d}")
+        nums.add(f"{n_val:03d}")
+    if item_code:
         m = re.search(r"\d{1,4}", str(item_code).strip())
         if m:
-            nums.add(str(int(m.group(0))))
+            n_val = int(m.group(0))
+            nums.add(str(n_val))
+            nums.add(f"{n_val:02d}")
+            nums.add(f"{n_val:03d}")
 
     # 1. Strip leading "Item 4:", "Item 4 (Non-SOR):", "Item 4 -", "4 Description:-", "4: "
     for n in nums:

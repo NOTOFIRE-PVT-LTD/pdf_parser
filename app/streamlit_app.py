@@ -845,12 +845,25 @@ def _render_message(msg: dict, chat: dict, idx: int) -> None:
         products = _all_products(chat)
         if products:
             rows = _product_rows(products)
-            st.dataframe(
-                rows,
+            import pandas as pd
+            df = pd.DataFrame(rows)
+            edited_df = st.data_editor(
+                df,
                 width="stretch",
                 hide_index=True,
                 height=min(360, 42 + 35 * len(rows)),
+                key=f"editor_{chat['id']}_{idx}",
             )
+            if edited_df is not None:
+                for i, row in edited_df.iterrows():
+                    if i < len(products):
+                        p = products[i]
+                        p.s_no = str(row.get("S.No.") or p.s_no) if row.get("S.No.") is not None else p.s_no
+                        p.product_name = str(row.get("Product Name") or p.product_name) if row.get("Product Name") is not None else p.product_name
+                        p.description = str(row.get("Description") or p.description) if row.get("Description") is not None else p.description
+                        p.item_qty = str(row.get("Qty") or p.item_qty) if row.get("Qty") is not None else p.item_qty
+                        p.qty_unit = str(row.get("Unit") or p.qty_unit) if row.get("Unit") is not None else p.qty_unit
+                        p.amount = str(row.get("Amount") or p.amount) if row.get("Amount") is not None else p.amount
 
     if msg.get("excel"):
         exporter = ExportService(settings)
@@ -862,35 +875,41 @@ def _render_message(msg: dict, chat: dict, idx: int) -> None:
             stem = Path(results[0].meta.filename if results[0].meta else "tender").stem
             csv_data = exporter.to_csv_bytes(results[0], which="products")
             xlsx_data = exporter.to_excel_bytes(results[0])
-            st.download_button(
-                "Download CSV",
-                data=csv_data,
-                file_name=f"{stem}.csv",
-                mime="text/csv",
-                key=f"dl_csv_{chat['id']}_{idx}",
-            )
-            st.download_button(
-                "Download Excel",
-                data=xlsx_data,
-                file_name=f"{stem}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"dl_xlsx_{chat['id']}_{idx}",
-            )
+            c1, c2, _ = st.columns([1, 1, 3], gap="small")
+            with c1:
+                st.download_button(
+                    "Download CSV",
+                    data=csv_data,
+                    file_name=f"{stem}.csv",
+                    mime="text/csv",
+                    key=f"dl_csv_{chat['id']}_{idx}",
+                )
+            with c2:
+                st.download_button(
+                    "Download Excel",
+                    data=xlsx_data,
+                    file_name=f"{stem}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_xlsx_{chat['id']}_{idx}",
+                )
         elif results:
-            st.download_button(
-                "Download CSV",
-                data=exporter.to_combined_csv_bytes(results),
-                file_name="tenders_export.csv",
-                mime="text/csv",
-                key=f"dl_csv_{chat['id']}_{idx}",
-            )
-            st.download_button(
-                "Download Excel",
-                data=exporter.to_combined_excel_bytes(results),
-                file_name="tenders_export.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"dl_xlsx_{chat['id']}_{idx}",
-            )
+            c1, c2, _ = st.columns([1, 1, 3], gap="small")
+            with c1:
+                st.download_button(
+                    "Download CSV",
+                    data=exporter.to_combined_csv_bytes(results),
+                    file_name="tenders_export.csv",
+                    mime="text/csv",
+                    key=f"dl_csv_{chat['id']}_{idx}",
+                )
+            with c2:
+                st.download_button(
+                    "Download Excel",
+                    data=exporter.to_combined_excel_bytes(results),
+                    file_name="tenders_export.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_xlsx_{chat['id']}_{idx}",
+                )
 
 
 def _build_pdf_reply(chat: dict, results: list[TenderResult]) -> dict:

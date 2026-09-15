@@ -2290,9 +2290,20 @@ class ProductExtractor:
         return out
 
     def _sort_key(self, p: ProductItem) -> tuple:
-        """Group by schedule, then S.No., then document position."""
+        """Group by schedule, then S.No./item_code natural number, then document position."""
         group = self._group_key(p)
-        sno = int(str(p.s_no).strip()) if is_list_serial(p.s_no) else 10**9
+        sno = 10**9
+        if is_list_serial(p.s_no):
+            sno = int(str(p.s_no).strip())
+        elif p.item_code:
+            m = re.search(r"\d+", str(p.item_code).strip())
+            if m:
+                sno = int(m.group(0))
+        elif p.s_no:
+            m = re.search(r"\d+", str(p.s_no).strip())
+            if m:
+                sno = int(m.group(0))
+
         if p.source_pos is not None:
             pos = p.source_pos
         elif p.page_numbers:

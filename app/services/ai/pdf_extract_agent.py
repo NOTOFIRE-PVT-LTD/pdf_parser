@@ -280,19 +280,134 @@ def _extract_chunk(
     return tender, products
 
 
+import base64
+from pathlib import Path
+import pymupdf
+
+from app.services.ai.gemini_client import generate_with_fallback
+
+
+def extract_with_gemini_vision(
+    pdf_path: str | Path,
+    settings: Settings | None = None,
+) -> tuple[TenderInformation | None, list[ProductItem], str | None]:
+    """
+    Direct multimodal PDF extraction via Gemini Vision API.
+    Renders PDF pages to crisp PNG images and queries Gemini Vision directly,
+    bypassing text coordinate scrambling.
+    """
+    settings = settings or get_settings()
+    if not getattr(settings, "gemini_api_key", None):
+        return None, [], "gemini_api_key_missing"
+
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        return None, [], "file_not_found"
+
+    try:
+        doc = pymupdf.open(pdf_path)
+    except Exception as exc:  # noqa: BLE001
+        return None, [], f"failed_to_open_pdf: {exc}"
+
+    try:
+        max_pages = getattr(settings, "max_pages", 15)
+        page_count = min(doc.page_count, max_pages)
+        parts: list[dict[str, Any]] = [
+            {
+                "text": _system_prompt()
+                + "\n\nAnalyze the attached visual PDF page images directly. Extract all header fields and BOQ product line items cleanly into the specified JSON format."
+            }
+        ]
+
+        for i in range(page_count):
+            page = doc.load_page(i)
+            pix = page.get_pixmap(dpi=150, alpha=False)
+            png_bytes = pix.tobytes("png")
+            b64_str = base64.b64encode(png_bytes).decode("utf-8")
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": "image/png",
+                        "data": b64_str,
+                    }
+                }
+            )
+    finally:
+        doc.close()
+
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "temperature": 0.0,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    try:
+        raw_text = generate_with_fallback(
+            key=settings.gemini_api_key,
+            configured_model=settings.gemini_model,
+            payload=payload,
+            base_url=settings.gemini_base_url,
+        )
+        parsed = _parse_json(raw_text)
+        tender_acc = parsed.get("tender") if isinstance(parsed.get("tender"), dict) else {}
+        products_raw = parsed.get("products") if isinstance(parsed.get("products"), list) else []
+
+        products: list[ProductItem] = []
+        for row in products_raw:
+            item = _row_to_product(row)
+            if item:
+                products.append(item)
+
+        products = _dedupe_products(products)
+        info = None
+        if tender_acc:
+            allowed = set(TenderInformation.model_fields)
+            info = TenderInformation(
+                **{k: tender_acc.get(k) for k in allowed if tender_acc.get(k)}
+            )
+
+        logger.info(
+            "Gemini Vision direct extract: %d pages processed → %d products extracted",
+            page_count,
+            len(products),
+        )
+        return info, products, None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Gemini Vision direct extraction failed: %s", exc)
+        return None, [], str(exc)
+
+
 def extract_with_ai(
     text: str,
     tables: list[ExtractedTable] | None = None,
+    pdf_path: str | Path | None = None,
     settings: Settings | None = None,
 ) -> tuple[TenderInformation | None, list[ProductItem], str | None]:
     """
     Returns (tender_info_or_None, products, error).
 
-    error is set when AI is unavailable or completely fails.
+    Tries Gemini Vision-First direct PDF extraction when pdf_path & gemini_api_key are present,
+    falling back to text chunking AI extraction if Vision returns no products.
     """
     settings = settings or get_settings()
     if not ai_available(settings):
         return None, [], "ai_unavailable"
+
+    if pdf_path and getattr(settings, "gemini_api_key", None):
+        try:
+            v_info, v_products, v_err = extract_with_gemini_vision(pdf_path, settings=settings)
+            if v_products:
+                return v_info, v_products, None
+            logger.info(
+                "Gemini Vision direct returned no products (%s), falling back to text chunking AI",
+                v_err,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Gemini Vision direct failed (%s), falling back to text chunking AI", exc
+            )
 
     chunks = _chunk_text(text)
     if not chunks:
@@ -339,3 +454,4 @@ def extract_with_ai(
     if not products and last_err:
         return info, [], last_err
     return info, products, None
+
