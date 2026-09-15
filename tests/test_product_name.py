@@ -246,3 +246,134 @@ def test_civil_work_paragraphs_are_not_products():
     assert is_work_description(work)
     assert is_work_description(trench)
     assert not is_work_description("Supply of 6 Quad Jelly Filled Cable 0.9mm")
+
+
+def test_spec_number_extracts_canonical_ids_not_english_fragments():
+    from app.utils.product_name import (
+        extract_item_drawing_number,
+        extract_item_inspection_agency,
+        extract_item_make_brand,
+        extract_item_spec_number,
+    )
+
+    spec_cases = [
+        (
+            "complete system as per RDSO Specification No. RDSO/SPN/176/2013 version 3 with Latest amendments",
+            "RDSO/SPN/176/2013 Ver. 3",
+        ),
+        (
+            "as per RDSO spec. RDSO/SPN/189/2004 Ver. 3.0 or latest",
+            "RDSO/SPN/189/2004 Ver. 3.0",
+        ),
+        (
+            "as per RDSO Specn.No.IRS:S-76/89 (Amnd-3) or latest",
+            "IRS:S-76/89 (Amnd-3)",
+        ),
+        (
+            "as per RDSO spec. No. IRS: S-75/2006 (Rev.2) or latest",
+            "IRS:S-75/2006 (Rev.2)",
+        ),
+        (
+            "as per Spec No IRS: S -78/92 with latest amendments",
+            "IRS:S-78/92",
+        ),
+        (
+            "as per IS: 2465/1984 and IS:694:2010 or latest",
+            "IS:2465/1984; IS:694:2010",
+        ),
+        (
+            "as per spec. No IS 2036 of 1995 or latest",
+            "IS 2036 of 1995",
+        ),
+        (
+            "as per IS 1239 (Part 1) 2004 or latest",
+            "IS 1239 (Part 1) 2004",
+        ),
+        (
+            "as per RDSO Specifi cation No. RDSO/SPN/204/2011 or latest",
+            "RDSO/SPN/204/2011",
+        ),
+        (
+            "as per RDSO/SPN/165/2012 or with latest amendment / specification rating",
+            "RDSO/SPN/165/2012",
+        ),
+        (
+            "as per RDSO Spec. No. IRS: TC 77-2012 (Rev.3.0) with (Amdt. -1 to 3)",
+            "IRS:TC-77-2012 (Rev.3.0)",
+        ),
+        (
+            "as per latest RDSO Specs, guidelines and technical specifications",
+            None,
+        ),
+        (
+            "Colour of the wire which is required will be specified by the Engineer",
+            None,
+        ),
+        (
+            "HDPE PIPE TO BE SUPPLIED AS PER RDSO SPEC. Contactor shall provide",
+            None,
+        ),
+        (
+            "(i) Supply of 4 conductor disconnect terminal block as per RDSO Spcn. No. RDSO/SPN/189/2004 Ver. 3.0 or latest.",
+            "RDSO/SPN/189/2004 Ver. 3.0",
+        ),
+    ]
+    for desc, expected in spec_cases:
+        got = extract_item_spec_number(desc)
+        assert got == expected, (desc[:60], got, expected)
+
+    assert extract_item_drawing_number(
+        "Plans/drawings/circuits etc. should be prepared on AUTO CAD"
+    ) is None
+    assert extract_item_drawing_number(
+        "Modification to existing drawings for stns. provided with Level Crossing"
+    ) is None
+    assert extract_item_drawing_number(
+        "as per Drawing. No. SA- 23748 (Alt.-4) or latest"
+    ) == "SA-23748 (Alt.-4)"
+    assert extract_item_drawing_number(
+        "as per RDSO drg. no. RDSO/S-11500 or latest"
+    ) == "RDSO/S-11500"
+
+    assert extract_item_inspection_agency("(Inspection by RDSO)") == "RDSO"
+    assert extract_item_inspection_agency("(Inspection by RITES/Consignee)") == "RITES/Consignee"
+    assert extract_item_inspection_agency("(Inspection by Consignee)") == "Consignee"
+
+    assert extract_item_make_brand(
+        "existingStation EI (M/s KYOSAN make Electronic Interlocking)"
+    ) == "KYOSAN"
+    assert extract_item_make_brand("Make Wago or Equivalent") == "Wago or Equivalent"
+    assert extract_item_make_brand("to make dual DP, Modem, ethernet switches") is None
+    assert extract_item_make_brand("steel grip make in four colours. Red") is None
+
+
+def test_footer_row_is_dropped_from_export():
+    items = sanitize_products([
+        ProductItem(
+            s_no="12",
+            item_code="No: PU-AGC-ST-MSDAC-T01A",
+            item_qty="-20",
+            unit_rate="26",
+            amount="ime: 15/0",
+            bidding_unit="9/2026 15:0",
+            description=None,
+        ),
+        ProductItem(
+            s_no="1",
+            item_qty="1.00",
+            unit_rate="32821337. 00",
+            amount="32821337.00",
+            description="Supply of Widget as per RDSO/SPN/176/2013 version 3",
+        ),
+    ])
+    assert len(items) == 1
+    assert items[0].s_no == "1"
+    assert items[0].unit_rate == "32821337.00"
+    row = ExportService().build_flat_rows(
+        TenderResult(
+            tender_information=TenderInformation(tender_no="PU-AGC-ST-MSDAC-T01A-2026"),
+            products=items,
+        )
+    )[0]
+    assert row["itemSpecNumber"] == "RDSO/SPN/176/2013 Ver. 3"
+    assert row["itemCode"] != "No: PU-AGC-ST-MSDAC-T01A"

@@ -2510,7 +2510,36 @@ class ProductExtractor:
         return ProductExtractor()._content_key(item)
 
     @staticmethod
+    def _looks_like_number(value: str | None) -> bool:
+        if not value:
+            return False
+        return bool(re.fullmatch(r"[\d,]+(?:\.\d+)?", re.sub(r"\s+", "", str(value))))
+
+    @staticmethod
+    def _is_footer_or_chrome_item(item: ProductItem) -> bool:
+        """Drop page footers parsed as BOQ rows (Tender No / Closing Date)."""
+        code = item.item_code or ""
+        desc = item.description or ""
+        unit = item.qty_unit or ""
+        amount = item.amount or ""
+        bidding = item.bidding_unit or ""
+        qty = item.item_qty or ""
+        if re.search(r"(?i)(?:tender\s*no|^no\s*:|closing\s*date)", code):
+            return True
+        if re.search(r"(?i)tender\s*no\s*:|closing\s*date\s*/?\s*time", desc):
+            return True
+        if re.search(r"(?i)\b(?:ime|time)\s*:", f"{unit} {amount}"):
+            return True
+        if not (desc or "").strip() and re.search(r"\d{1,2}/\d{4}", bidding):
+            return True
+        if re.match(r"^\s*-", qty):
+            return True
+        return False
+
+    @staticmethod
     def _is_valid_item(item: ProductItem) -> bool:
+        if ProductExtractor._is_footer_or_chrome_item(item):
+            return False
         sno = (item.s_no or "").strip()
         if sno:
             if not re.fullmatch(r"\d+", sno):
@@ -2522,11 +2551,10 @@ class ProductExtractor:
             return False
         if item.item_code and POINTER_TEXT.search(item.item_code):
             return False
-        has_qty = bool(item.item_qty and re.search(r"\d", item.item_qty))
-        has_money = bool(
-            (item.unit_rate and re.search(r"\d", item.unit_rate))
-            or (item.amount and re.search(r"\d", item.amount))
-        )
+        has_qty = ProductExtractor._looks_like_number(item.item_qty)
+        has_money = ProductExtractor._looks_like_number(
+            item.unit_rate
+        ) or ProductExtractor._looks_like_number(item.amount)
         has_desc = bool(desc and len(desc) > 3)
         has_sno = bool(sno and re.fullmatch(r"\d+", sno))
         # GeM Item Category rows: title + serial, no per-line qty in Bid PDF

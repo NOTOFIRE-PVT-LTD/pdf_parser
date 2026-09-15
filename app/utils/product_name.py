@@ -525,61 +525,132 @@ class ProductNameLearning:
         }
 
 
+# Canonical spec IDs only — never English leftovers like "ifications" / "tion".
+_SPEC_ID = re.compile(
+    r"(?i)("
+    r"RDSO\s*/\s*SPN\s*/\s*\d{2,4}\s*/\s*\d{4}"
+    r"(?:\s*(?:Ver(?:sion)?\.?|Rev\.?)\s*[\d.]+)?"
+    r"|"
+    r"IRS\s*:?\s*(?:S|TC)\s*[-–]?\s*\d{1,3}"
+    r"(?:\s*[/\-]\s*\d{2,4})?"
+    r"(?:\s*\((?:Amnd|Amdt|Rev)[^)]{0,24}\))?"
+    r"|"
+    r"IS\s*:?\s*\d{3,5}"
+    r"(?:\s*:\s*\d{4})?"
+    r"(?:\s*/\s*\d{4})?"
+    r"(?:\s*\(\s*Part\s*\d+\s*\))?"
+    r"(?:\s*(?:(?:of|/)\s*)?\d{4})?"
+    r"|"
+    r"IEC\s*[-–]?\s*\d{4,6}(?:[-–]\d+)?"
+    r")"
+)
+
+_DRAWING_ID = re.compile(
+    r"(?i)(?:drawing\.?|drg\.?|sketch\.?)\s*(?:no\.?|number)?\s*[:\-]?\s*"
+    r"("
+    r"RDSO\s*/\s*S\s*[-–]?\s*\d{4,6}"
+    r"|SA\s*[-–]?\s*\d{4,6}[A-Z]?"
+    r"(?:\s*\([^)]{0,20}\))?"
+    r"|SDO\s*/\s*[A-Z0-9 _/]*\d+[A-Z0-9 _/]*"
+    r"|S&T\s*/\s*[A-Z0-9./]+"
+    r"|TYP\s*/\s*\d+(?:\s*/\s*\d+)?"
+    r"|SK\.?\s*\d+\s*/\s*\d+"
+    r"|AGC\s*/\s*[A-Za-z]+\s*/\s*\d{4}\s*/\s*\d+"
+    r"|CSTE\s*/\s*[A-Z0-9.\-/]*\d[A-Z0-9.\-/]*"
+    r")"
+)
+
+_INSPECTION_AGENCY = re.compile(
+    r"(?i)(?:\(\s*)?inspection\s*(?:by|:)?\s*"
+    r"(RDSO|RITES(?:\s*/\s*Consignee)?|Consignee)\b"
+)
+
+
+def _prep_spec_text(text: str) -> str:
+    text = re.sub(r"(?i)specifi\s+cation", "specification", text)
+    text = re.sub(r"(?i)specn\s*\.\s*no", "specn. no", text)
+    text = re.sub(r"(?i)spec\s*\.\s*no", "spec. no", text)
+    return text
+
+
+def _tidy_spec_id(raw: str) -> str:
+    s = re.sub(r"\s+", " ", raw).strip()
+    s = re.sub(r"(?i)\bRDSO\s*/\s*", "RDSO/", s)
+    s = re.sub(r"(?i)\bIRS\s*:\s*", "IRS:", s)
+    s = re.sub(r"(?i)IRS:(S|TC)\s*[-–]\s*", lambda m: f"IRS:{m.group(1).upper()}-", s)
+    s = re.sub(r"(?i)\bIS\s*:\s*", "IS:", s)
+    s = re.sub(r"(?i)IRS:(S|TC)\s+", lambda m: f"IRS:{m.group(1).upper()}-", s)
+    s = re.sub(r"(?i)\bversion\b", "Ver.", s)
+    return s
+
+
 def extract_item_specs(desc: str | None) -> str | None:
-    text = normalize_product_description(desc)
-    if not text:
-        return None
-    for pattern in (
-        r"(?i)as\s+per\s+[^.;)]+",
-        r"(?i)conforming\s+to\s+[^.;)]+",
-        r"(?i)spec(?:ification)?\.?\s*(?:no\.?)?\s*[A-Z0-9/\-]+[^.;)]*",
-        r"(?i)inspection\s*:\s*[^.)]+",
-    ):
-        m = re.search(pattern, text)
-        if m:
-            return m.group(0).strip()
-    return None
+    return extract_item_spec_number(desc)
 
 
 def extract_item_spec_number(desc: str | None) -> str | None:
-    """Spec / RDSO / IRS number only when description explicitly labels it."""
-    text = normalize_product_description(desc)
+    """Return RDSO/IRS/IS/IEC numbers only — never English fragments of 'spec'."""
+    text = _prep_spec_text(normalize_product_description(desc) or "")
     if not text:
         return None
-    for pattern in (
-        r"(?i)(?:spec(?:ification)?\.?\s*(?:no\.?)?|as\s+per)\s*"
-        r"((?:RDSO|IRS|IS|IEC)[/A-Z0-9.\-]+(?:\s*ver(?:sion)?[-\s]*[\d.]+)?)",
-        r"(?i)spec(?:ification)?\.?\s*(?:no\.?)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9/\-.]{3,})",
-    ):
-        m = re.search(pattern, text)
-        if m:
-            return m.group(1).strip()
-    return None
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in _SPEC_ID.finditer(text):
+        spec = _tidy_spec_id(m.group(1))
+        key = re.sub(r"[\s.:]", "", spec).upper()
+        if not spec or key in seen:
+            continue
+        seen.add(key)
+        found.append(spec)
+    return "; ".join(found) if found else None
 
 
 def extract_item_drawing_number(desc: str | None) -> str | None:
     text = normalize_product_description(desc)
     if not text:
         return None
-    m = re.search(
-        r"(?i)(?:drawing|drg\.?)\s*(?:no\.?|number)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9/\-.]+)",
-        text,
-    )
-    return m.group(1).strip() if m else None
+    m = _DRAWING_ID.search(text)
+    if not m:
+        return None
+    val = re.sub(r"\s+", " ", m.group(1)).strip().rstrip(".,;")
+    val = re.sub(r"(?i)\bRDSO\s*/\s*", "RDSO/", val)
+    val = re.sub(r"([A-Z])-\s+(\d)", r"\1-\2", val)
+    if not re.search(r"\d", val):
+        return None
+    return val or None
 
 
 def extract_item_make_brand(desc: str | None) -> str | None:
     text = normalize_product_description(desc)
     if not text:
         return None
-    m = re.search(
-        r"(?i)\b(?:make|brand|oem)\s*[:\-]?\s*([A-Za-z][A-Za-z0-9 &\-./]{1,40})",
+
+    ms = re.search(r"(?i)\bM/?s\.?\s+([A-Z][A-Za-z0-9.&]{1,40})\s+make\b", text)
+    if ms:
+        return ms.group(1).strip()
+
+    paren = re.search(r"\(([A-Z][A-Za-z0-9/& \-]{1,40})\s+MAKE\)", text, re.I)
+    if paren:
+        return paren.group(1).strip()
+
+    labeled = re.search(
+        r"(?i)\bmake\s*[:\-]?\s*"
+        r"([A-Z][A-Za-z0-9.&]{1,24}"
+        r"(?:\s*/\s*[A-Z][A-Za-z0-9.&]{1,24}){0,3}"
+        r"(?:\s+or\s+[Ee]quivalent)?)",
         text,
     )
-    if not m:
+    if not labeled:
         return None
-    val = m.group(1).strip().rstrip(".,;")
-    if re.match(r"(?i)^(as|per|of|the|and|with)\b", val):
+    prefix = text[max(0, labeled.start() - 3) : labeled.start()].lower()
+    if prefix.endswith("to "):
+        return None
+    val = labeled.group(1).strip().rstrip(".,;")
+    if re.search(r"(?i)\bor\s+similar\b", labeled.group(0)):
+        return None
+    if re.match(r"(?i)^(as|per|of|the|and|with|in|for|or)\b", val):
+        return None
+    if len(val.split()) > 5:
         return None
     return val or None
 
@@ -588,10 +659,10 @@ def extract_item_inspection_agency(desc: str | None) -> str | None:
     text = normalize_product_description(desc)
     if not text:
         return None
-    m = re.search(r"(?i)inspection\s*[:\-]?\s*([A-Za-z][A-Za-z0-9 &\-./]{1,40})", text)
-    if m:
-        return m.group(1).strip().rstrip(".,;")
-    return None
+    m = _INSPECTION_AGENCY.search(text)
+    if not m:
+        return None
+    return re.sub(r"\s+", " ", m.group(1)).strip()
 
 
 def extract_item_warranty_period(desc: str | None) -> str | None:

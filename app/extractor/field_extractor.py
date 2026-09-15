@@ -196,7 +196,8 @@ class FieldExtractor:
 
         if data.get("name_of_work"):
             data["name_of_work"] = truncate(
-                collapse_whitespace(data["name_of_work"]), 1000
+                collapse_whitespace(re.sub(r"\s+col_\d+\b", "", str(data["name_of_work"]))),
+                1000,
             )
 
         # Final sanitize short fields so UI never shows paragraph dumps

@@ -34,13 +34,50 @@ def _clean_description(value: str | None) -> str | None:
     return text.lstrip("-–— ").strip() or None
 
 
+def _looks_like_number(value: Any) -> bool:
+    if not value:
+        return False
+    return bool(re.fullmatch(r"[\d,]+(?:\.\d+)?", re.sub(r"\s+", "", str(value))))
+
+
+def _clean_numeric(value: Any) -> Any:
+    if value is None:
+        return None
+    text = re.sub(r"(\d)\.\s+(\d)", r"\1.\2", str(value).strip())
+    compact = re.sub(r"\s+", "", text)
+    if re.fullmatch(r"[\d,]+(?:\.\d+)?", compact):
+        return compact
+    return value
+
+
+def _is_footer_or_chrome_row(data: dict[str, Any], desc: str | None) -> bool:
+    code = str(data.get("item_code") or "")
+    unit = str(data.get("qty_unit") or "")
+    amount = str(data.get("amount") or "")
+    bidding = str(data.get("bidding_unit") or "")
+    qty = str(data.get("item_qty") or "")
+    if re.search(r"(?i)(?:tender\s*no|^no\s*:|closing\s*date)", code):
+        return True
+    if desc and re.search(r"(?i)tender\s*no\s*:|closing\s*date\s*/?\s*time", desc):
+        return True
+    if re.search(r"(?i)\b(?:ime|time)\s*:", f"{unit} {amount}"):
+        return True
+    if not (desc or "").strip() and re.search(r"\d{1,2}/\d{4}", bidding):
+        return True
+    if re.match(r"^\s*-", qty):
+        return True
+    return False
+
+
 def _is_valid_row(data: dict[str, Any], desc: str | None) -> bool:
+    if _is_footer_or_chrome_row(data, desc):
+        return False
     qty = str(data.get("item_qty") or "").strip()
     rate = str(data.get("unit_rate") or "").strip()
     amount = str(data.get("amount") or "").strip()
     sno = str(data.get("s_no") or "").strip()
-    has_qty = bool(re.search(r"\d", qty))
-    has_money = bool(re.search(r"\d", rate) or re.search(r"\d", amount))
+    has_qty = _looks_like_number(qty)
+    has_money = _looks_like_number(rate) or _looks_like_number(amount)
     has_desc = bool(desc and len(desc) > 3)
     has_sno = bool(sno and re.fullmatch(r"\d+", sno))
     schedule = str(data.get("schedule") or "")
@@ -93,6 +130,9 @@ def sanitize_products(raw_products: list[Any]) -> list[ProductItem]:
 
         data["s_no"] = sno or None
         data["description"] = desc
+        for num_field in ("item_qty", "unit_rate", "basic_value", "amount"):
+            if data.get(num_field):
+                data[num_field] = _clean_numeric(data[num_field])
 
         # Prefer learned / existing name; heuristic is only a soft assist.
         # Do NOT drop the row when name cannot be derived — AI + user
